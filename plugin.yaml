@@ -1,0 +1,10 @@
+name: feishu-command-palette
+version: 1.0.0
+description: Interactive Feishu/Lark single-card control panel to dispatch Hermes
+  slash commands directly bypassing LLM turn.
+author: billzai
+category: platform
+hooks:
+- pre_gateway_dispatch
+provides_hooks:
+- pre_gateway_dispatch
