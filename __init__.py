@@ -39,6 +39,9 @@ import yaml
 
 logger = logging.getLogger("command-palette")
 
+STREAMING_ENABLED = True
+STREAM_PATCH_INTERVAL = 0.8  # 飞书卡片动态刷新最小间隔秒数，保护 API 频控
+
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 AUTH_PATH = HERMES_HOME / "auth.json"
@@ -293,6 +296,121 @@ def run_subprocess(argv: list[str], *, timeout: int, input_text: str | None = No
         return CmdResult(False, out or "", err or "", -9, True, time.monotonic() - start)
 
 
+def run_subprocess_streaming(argv: list[str], *, timeout: int,
+                              on_chunk: Optional[Callable[[str, float], None]] = None,
+                              on_tick: Optional[Callable[[float], None]] = None) -> CmdResult:
+    start = time.monotonic()
+    try:
+        import pty
+        import select as _select
+    except ImportError:
+        return run_subprocess(argv, timeout=timeout)
+
+    try:
+        master, slave = pty.openpty()
+    except Exception:
+        return run_subprocess(argv, timeout=timeout)
+
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=slave, stdout=slave, stderr=slave,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        os.close(master)
+        os.close(slave)
+        return CmdResult(False, stderr=f"可执行文件不存在: {argv[0]}", exit_code=127)
+    except Exception as e:
+        os.close(master)
+        os.close(slave)
+        return CmdResult(False, stderr=f"进程拉起失败: {e}", exit_code=126)
+
+    os.close(slave)
+    out_parts: list[str] = []
+    last_tick: float = time.monotonic()
+
+    try:
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed > timeout:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    os.close(master)
+                except Exception:
+                    pass
+                proc.wait()
+                return CmdResult(False, "".join(out_parts), "", -9, True, elapsed)
+
+            try:
+                rlist, _, _ = _select.select([master], [], [], 0.1)
+            except Exception:
+                break
+
+            if rlist:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                text = data.decode("utf-8", errors="replace")
+                out_parts.append(text)
+                last_tick = time.monotonic()
+                if on_chunk is not None:
+                    try:
+                        on_chunk(text, time.monotonic() - start)
+                    except Exception:
+                        pass
+            else:
+                # 心跳：无新数据超过 1 秒且进程仍存活时触发
+                now = time.monotonic()
+                if on_tick is not None and now - last_tick >= 1.0 and proc.poll() is None:
+                    last_tick = now
+                    try:
+                        on_tick(now - start)
+                    except Exception:
+                        pass
+
+                if proc.poll() is not None:
+                    # 进程已结束，排尽缓冲区
+                    try:
+                        while True:
+                            rlist2, _, _ = _select.select([master], [], [], 0.05)
+                            if not rlist2:
+                                break
+                            data = os.read(master, 4096)
+                            if not data:
+                                break
+                            text = data.decode("utf-8", errors="replace")
+                            out_parts.append(text)
+                            if on_chunk is not None:
+                                try:
+                                    on_chunk(text, time.monotonic() - start)
+                                except Exception:
+                                    pass
+                    except OSError:
+                        pass
+                    break
+    except Exception:
+        pass
+
+    try:
+        os.close(master)
+    except Exception:
+        pass
+    proc.wait()
+
+    out = "".join(out_parts)
+    elapsed = time.monotonic() - start
+    is_ok = (proc.returncode == 0) or (argv[1:2] == ["doctor"] and bool(out.strip()))
+    return CmdResult(is_ok, out, "", proc.returncode or 0, False, elapsed)
+
+
 def run_lark(args: list[str], *, timeout: int = 20) -> CmdResult:
     return run_subprocess(["lark-cli", *args], timeout=timeout)
 
@@ -348,14 +466,14 @@ CLI_CMDS: dict[str, dict] = {
     "/context":  {"label": "上下文分析", "cli": ["hermes", "prompt-size"]},
     "/usage":    {"label": "配额用量", "cli": ["hermes", "usage"]},
     "/sessions": {"label": "历史会话", "cli": ["hermes", "sessions", "list", "--limit", "10"]},
-    # 工具研发
-    "/diff":     {"label": "代码差异", "cli": ["git", "-C", str(INSTALL_PATH), "diff", "--stat"]},
-    "/doctor":   {"label": "健康诊断", "cli": ["hermes", "doctor"]},
-    "/debug":    {"label": "调试摘要", "cli": ["hermes", "debug", "share", "--local"]},
-    "/security": {"label": "安全审计", "cli": ["hermes", "security", "audit"]},
+    # 工具研发（部分命令配置独立超时）
+    "/diff":     {"label": "代码差异", "cli": ["git", "-C", str(INSTALL_PATH), "diff", "--stat"], "timeout": 45},
+    "/doctor":   {"label": "健康诊断", "cli": ["hermes", "doctor"], "timeout": 120},
+    "/debug":    {"label": "调试摘要", "cli": ["hermes", "debug", "share", "--local"], "timeout": 45},
+    "/security": {"label": "安全审计", "cli": ["hermes", "security", "audit"], "timeout": 60},
     "/logs":     {"label": "网关日志", "cli": ["hermes", "logs", "gateway", "-n", "40"]},
     "/cron":     {"label": "定时任务", "cli": ["hermes", "cron", "list"]},
-    "/plugins":  {"label": "插件列表", "cli": ["hermes", "plugins", "list"]},
+    "/plugins":  {"label": "插件列表", "cli": ["hermes", "plugins", "list"], "timeout": 45},
     "/skills":   {"label": "技能库",   "cli": ["hermes", "skills", "list"]},
     "/bundles":  {"label": "技能包",   "cli": ["hermes", "bundles"]},
     "/memory":   {"label": "记忆系统", "cli": ["hermes", "memory"]},
@@ -365,6 +483,8 @@ CLI_CMDS: dict[str, dict] = {
     "/config":   {"label": "配置概览", "cli": ["hermes", "config", "show"]},
     "/whoami":   {"label": "身份凭证", "cli": ["hermes", "auth", "list"]},
 }
+
+_DEFAULT_CMD_TIMEOUT = 35
 
 CONFIG_CMDS: dict[str, dict] = {
     "/model":         {"label": "模型切换", "kind": "picker"},
@@ -1094,6 +1214,33 @@ def _build_exec_confirm_card(cmd: str, args: str, token: str) -> dict:
     return _card(f"⚠️ 确认 {meta.get('label', cmd)}", "red", elements)
 
 
+def _build_streaming_card(cmd: str, elapsed: float, recent_lines: list[str],
+                           is_heartbeat: bool = False) -> dict:
+    meta = _CMD_META.get(cmd, {})
+    label = meta.get("label", cmd)
+    header_content = f"⚡ **正在执行 {label} ({cmd})**  |  ⏱️ {elapsed:.1f}s"
+    if recent_lines:
+        log_block = "```text\n" + "\n".join(recent_lines) + "\n```"
+        subtitle = f"⏳ **终端输出实时捕获中** · 已耗时 `{elapsed:.1f}s`"
+    elif is_heartbeat:
+        log_block = "⏳ *后台深度检测中，暂无终端输出...*"
+        subtitle = f"⏳ **后台深度检测中** · 已耗时 `{elapsed:.1f}s`（进程活跃运行中）"
+    else:
+        log_block = "⏳ *等待终端首包输出...*"
+        subtitle = f"⏳ **终端输出实时捕获中** · 已耗时 `{elapsed:.1f}s`"
+    elements = [
+        {"tag": "markdown", "content": subtitle},
+        {"tag": "markdown", "content": log_block},
+        {"tag": "markdown", "content": "ℹ️ *流式动态卡片实验中（动态刷新），执行完毕将自动折叠为完整报告*"},
+        _nav_row_for_deep_page(CMD_PARENT_CATEGORY.get(cmd, "/card/root")),
+    ]
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": header_content}, "template": "blue"},
+        "elements": elements,
+    }
+
+
 def _build_running_card(cmd: str) -> dict:
     meta = _CMD_META.get(cmd, {})
     elements = [
@@ -1167,7 +1314,7 @@ def _build_beautiful_result_card(cmd: str, raw_output: str, elapsed: float = 0.0
     label = meta.get("label", cmd)
 
     if timed_out:
-        raw_output = f"⚠️ 命令执行超时（50秒限制）\n\n{raw_output}"
+        raw_output = f"⚠️ 命令执行超时（已捕获部分输出）\n\n{raw_output}"
 
     sub_elements, _saved = parse_and_beautify_output(cmd, raw_output)
     if not saved_path:
@@ -1264,12 +1411,68 @@ def _async(fn: Callable, *args) -> None:
 
 def _execute_cli_async(cmd: str, mid: str) -> None:
     meta = CLI_CMDS.get(cmd, {})
-    t0 = time.monotonic()
     argv = meta.get("cli") or ["hermes", cmd.lstrip("/")]
-    res = run_subprocess(argv, timeout=50)
+    cmd_timeout = meta.get("timeout", _DEFAULT_CMD_TIMEOUT)
 
+    if not STREAMING_ENABLED or not mid:
+        t0 = time.monotonic()
+        res = run_subprocess(argv, timeout=cmd_timeout)
+        elapsed = time.monotonic() - t0
+        output_text = res.stdout if res.ok else (res.stderr or res.stdout or f"exit code {res.exit_code}")
+        if res.timed_out and output_text:
+            safe_cmd = cmd.strip("/").replace(" ", "_") or "output"
+            ts_str = time.strftime("%Y%m%d_%H%M%S")
+            partial_path = Path(f"/tmp/hermes_{safe_cmd}_timeout_{ts_str}.txt")
+            try:
+                partial_path.write_text(_strip_ansi(output_text), encoding="utf-8")
+            except Exception:
+                pass
+        card = _build_beautiful_result_card(cmd, output_text, elapsed=elapsed, ok=res.ok, timed_out=res.timed_out)
+        if mid:
+            _patch_card(mid, card)
+        return
+
+    t0 = time.monotonic()
+    last_patch: list[float] = [0.0]
+    chunks: list[str] = []
+    has_output: list[bool] = [False]
+
+    def _update_stream_card(elapsed: float, is_heartbeat: bool = False) -> None:
+        now = time.monotonic()
+        if now - last_patch[0] < STREAM_PATCH_INTERVAL:
+            return
+        last_patch[0] = now
+        raw_all = "".join(chunks)
+        clean = _strip_ansi(raw_all)
+        lines = [line.strip() for line in clean.splitlines() if line.strip()][-8:]
+        lines = [line[:120] for line in lines]
+        stream_card = _build_streaming_card(cmd, elapsed, lines, is_heartbeat=is_heartbeat)
+        try:
+            _patch_card(mid, stream_card)
+        except Exception as e:
+            logger.debug("[command-palette] stream patch failed: %s", e)
+
+    def on_chunk(text: str, elapsed: float) -> None:
+        chunks.append(text)
+        has_output[0] = True
+        _update_stream_card(elapsed, is_heartbeat=False)
+
+    def on_tick(elapsed: float) -> None:
+        _update_stream_card(elapsed, is_heartbeat=not has_output[0])
+
+    res = run_subprocess_streaming(argv, timeout=cmd_timeout, on_chunk=on_chunk, on_tick=on_tick)
     elapsed = time.monotonic() - t0
     output_text = res.stdout if res.ok else (res.stderr or res.stdout or f"exit code {res.exit_code}")
+
+    if res.timed_out and output_text:
+        safe_cmd = cmd.strip("/").replace(" ", "_") or "output"
+        ts_str = time.strftime("%Y%m%d_%H%M%S")
+        partial_path = Path(f"/tmp/hermes_{safe_cmd}_timeout_{ts_str}.txt")
+        try:
+            partial_path.write_text(_strip_ansi(output_text), encoding="utf-8")
+        except Exception:
+            pass
+
     card = _build_beautiful_result_card(cmd, output_text, elapsed=elapsed, ok=res.ok, timed_out=res.timed_out)
     if mid:
         _patch_card(mid, card)
