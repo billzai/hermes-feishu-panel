@@ -64,14 +64,14 @@
 
 ## 2. 核心特性矩阵
 
-- **🌐 首页中英文瞬时切换 (In-Place Language Toggle)**：状态栏集成 `[ 🌐 English ]` / `[ 🌐 简体中文 ]` 极简切换按钮，默认纯中文（4字大字体，零截断），点击毫秒级原地重绘为纯英文，全链路二级菜单、选项卡与报告完美跟随解耦。
+- **🌐 首页中英文瞬时切换 (In-Place Language Toggle)**：状态栏集成 `[ 🇨🇳 CN ]` / `[ 🇬🇧 EN ]` 极简国旗状态按钮，默认纯中文（4字大字体，零截断），点击毫秒级原地重绘为纯英文，全链路二级菜单、选项卡与报告完美跟随解耦。
 - **🎛️ 单卡片原地流转 (In-Place Lifecycle)**：从一级菜单导航、二级选项卡选择，到终端流式预览与最终报告，100% 在当前卡片内原地重绘，零新增消息骚扰。
 - **📂 原生可折叠抽屉 (Native Collapsible Panels)**：全面适配飞书原生 `collapsible_panel` 组件。长输出（如 `/doctor` 的 17 项诊断）自动收纳为折叠抽屉，异常模块（`🔴`）与概览智能默认展开，健康模块默认收起，卡片高度永久保持在一屏内。
 - **⚡ PTY 虚拟终端流式 (Terminal Streaming)**：采用系统伪终端（`pty.openpty()`）实时捕获子进程 stdout，配合 0.8s 滑动窗口动态节流刷新，拒绝黑盒死等。
-- **💓 运行态智能心跳 (Silent Heartbeat)**：在数据库热备份等长达 20s 无标准输出的静默期，心跳引擎每 1.0s 驱动秒数递增跳动（`⏱️ 22.9s 后台深度检测中`），视觉无假死感。
-- **⏱️ 自适应超时分级 (Adaptive Timeout Tiers)**：精细化分配执行预算（`/doctor` 120s、`/security` 60s、常规 35s），杜绝重任务被误杀。
+- **⏱️ 分级自适应超时与静默心跳**：根据命令性质实施动态分级（普通命令 35s、重度备份 `/doctor` 120s），无输出静默期每 1.0s 自增心跳节拍，杜绝假死。
+- **🛑 命令冷却与防抖机制**：高频连击与重试设 3.0s 滑动冷却窗口，阻断恶意重复派发，彻底消除飞书服务端 99992354 报错与进程风暴。
 - **🛡️ Fail-Closed RBAC 鉴权 (读写分离)**：普通状态查询对会话成员开放；写操作（模型切换、配置修改、`/yolo`、`/stop`）强制校验 `FEISHU_ADMINS` 白名单，未配管理员默认禁止写入。
-- **🔒 官方原子配置写入 (Safe Atomic Set)**：彻底废弃全盘覆写，改用官方 `hermes config set <key> <val> --yes` CLI 原子更新，严格校验参数白名单，保留所有 YAML 注释。
+- **🔒 官方原子配置写入 (Safe Atomic Set)**：彻底废弃全盘覆写，改用官方 `hermes config set <key> <val>` CLI 原子更新，严格校验参数白名单，保留所有 YAML 注释。
 - **📦 沙箱隔离存储 (Sandboxed Plugin Data)**：输出文件统一落盘至 `~/.hermes/plugin-data/feishu-command-palette/`（权限 `0700`），配备 7 天 TTL 自动清理，严禁侵入系统 `/tmp`。
 - **🌐 英文优先双语 UI (Bilingual English-First)**：标题、按钮、状态行全面采用规范双语呈现，无缝衔接国内与国际开发者环境。
 
@@ -243,14 +243,14 @@ Operating autonomous AI agents via messaging platforms usually suffers from 4 ma
 
 ## 2. Key Features
 
-- **🌐 In-Place Language Switching**: Seamless `[ 🌐 English ]` / `[ 🌐 简体中文 ]` toggle directly on the status bar. Pure Chinese by default (zero truncation on mobile), switchable to pure English instantly with full sub-menu and report localization.
+- **🌐 In-Place Language Switching**: Seamless `[ 🇨🇳 CN ]` / `[ 🇬🇧 EN ]` flag toggle directly on the status bar. Pure Chinese by default (zero truncation on mobile), switchable to pure English instantly with full sub-menu and report localization.
 - **🎛️ In-Place Lifecycle Transitions**: Root menus, sub-options, live streaming previews, and final reports all render within the same card. Zero spam.
 - **📂 Native Collapsible Panels**: Deep integration with Lark's native `collapsible_panel`. Complex outputs (e.g. `/doctor`'s 17 sections) fold into clean drawers. Warnings/errors expand automatically; healthy sections collapse by default.
 - **⚡ PTY Live Terminal Streaming**: Uses system pseudo-terminals (`pty.openpty()`) to capture live process output, refreshed smoothly at 0.8s intervals.
-- **💓 Active Silent Heartbeat**: During long silent operations (e.g. SQLite snapshot verification), active heartbeats tick every 1.0s to confirm background vitality.
-- **⏱️ Adaptive Timeout Tiers**: Tiered execution budgets (120s for `/doctor`, 60s for `/security`, 35s default) prevent premature termination.
+- **⏱️ Tiered Adaptive Timeouts & Silent Heartbeat**: Command-aware budget allocation (`/doctor` 120s, regular 35s) paired with 1.0s incrementing heartbeat ticks during silent execution phases.
+- **🛑 Debounce & Cooldown Engine**: 3.0s sliding cooldown prevents rapid re-clicks and process storms.
 - **🛡️ Owner-Only Execution & Public Browsing**: Everyone can navigate menus, switch options, and fold drawers. Command execution, model switching, and settings are strictly locked to the instance owner (`FEISHU_ADMINS`). Non-owners clicking execution buttons are safely blocked with zero host processes spawned.
-- **🔒 Safe Atomic Config Updates**: Uses official `hermes config set <key> <val> --yes` CLI with parameter whitelisting. Preserves all YAML comments.
+- **🔒 Safe Atomic Config Updates**: Uses official `hermes config set <key> <val>` CLI with parameter whitelisting. Preserves all YAML comments.
 - **📦 Isolated Sandboxed Storage**: Process outputs are stored under `~/.hermes/plugin-data/feishu-command-palette/` (0700) with a 7-day TTL auto-purge. Zero `/tmp` pollution.
 - **🌐 English-First Bilingual UI**: Standardized English UI with concise bilingual subtitles for seamless global usage.
 

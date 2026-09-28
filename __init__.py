@@ -103,8 +103,8 @@ I18N = {
     "zh": {
         "title": "Hermes 控制面板",
         "quick_actions": "⚡ 快捷操作",
-        "switch_lang_btn": "🌐 English",
-        "switch_lang_toast": "已切换为英文 / Switched to English",
+        "switch_lang_btn": "🇨🇳 CN",
+        "switch_lang_toast": "已切换为简体中文 / Switched to Chinese",
         "back": "⬅ 返回",
         "home": "🏠 首页",
         "run": "执行",
@@ -152,8 +152,8 @@ I18N = {
     "en": {
         "title": "Hermes Control Panel",
         "quick_actions": "⚡ Quick Actions",
-        "switch_lang_btn": "🌐 简体中文",
-        "switch_lang_toast": "已切换为简体中文 / Switched to Chinese",
+        "switch_lang_btn": "🇬🇧 EN",
+        "switch_lang_toast": "已切换为英文 / Switched to English",
         "back": "⬅ Back",
         "home": "🏠 Home",
         "run": "Run",
