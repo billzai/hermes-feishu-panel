@@ -14,6 +14,7 @@
 ## ✨ Features (特性)
 
 - **🎛️ In-Place Lifecycle (单卡片全生命周期)**: All navigations, command runs, and setting toggles happen in-place without message flooding.
+- **📂 Native Collapsible Panels (原生可折叠面板)**: Multi-section diagnostic reports (`/doctor`, `/status`) and long outputs automatically render as native interactive collapsible drawers (`collapsible_panel`), preventing chat screen flooding.
 - **⚡ PTY Live Streaming (终端流式展示)**: Captures live process output using virtual pseudo-terminals with rate-limited patch updates (0.8s) and active heartbeats.
 - **⏱️ Adaptive Timeout Tiers (自适应超时分级)**: Tiered timeouts (e.g., 120s for `/doctor`, 60s for `/security`, 35s default) to avoid premature termination during deep diagnostics.
 - **🛡️ Strict Fail-Closed RBAC (权限隔离门禁)**: Write operations (`confirm_switch`, `set_cfg`, `/yolo`, `/stop`) strictly require configured `FEISHU_ADMINS`. Unprivileged users can only perform read-only queries.

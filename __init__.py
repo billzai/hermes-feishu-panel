@@ -126,6 +126,28 @@ def _format_unified_line(line: str) -> str:
     return f"• {clean_s}" if clean_s else ""
 
 
+def _collapsible_panel(title: str, elements: list[dict], expanded: bool = False) -> dict:
+    """标准飞书卡片可折叠面板组件（Schema 1.0/2.0 原生支持）"""
+    return {
+        "tag": "collapsible_panel",
+        "expanded": expanded,
+        "header": {
+            "title": {"tag": "plain_text", "content": str(title)},
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "color": "grey",
+                "size": "16px",
+            },
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
+        },
+        "border": {"color": "grey", "corner_radius": "8px"},
+        "padding": "8px 12px 8px 12px",
+        "elements": elements,
+    }
+
+
 def _beautify_unified(cmd: str, clean_text: str) -> list[dict]:
     elements: list[dict] = []
     if not clean_text:
@@ -140,15 +162,31 @@ def _beautify_unified(cmd: str, clean_text: str) -> list[dict]:
         lines = clean_text.splitlines()
         formatted_lines = [_format_unified_line(l) for l in lines]
         formatted_lines = [l for l in formatted_lines if l]
-        content_body = "\n".join(formatted_lines[:45])
-        if len(formatted_lines) > 45:
-            content_body += "\n• *(Output truncated in card / 已截断展示)*"
-        elements.append({
-            "tag": "markdown",
-            "content": f"**📌 Details (查询详情)**\n{content_body}",
-        })
+        total_lines = len(formatted_lines)
+        if total_lines <= 8:
+            elements.append({
+                "tag": "markdown",
+                "content": f"**📌 Details (查询详情)**\n" + "\n".join(formatted_lines),
+            })
+        else:
+            # 超过 8 行的长输出：顶部展示前 3 行预览，完整内容置入可折叠面板
+            preview = "\n".join(formatted_lines[:3])
+            full_body = "\n".join(formatted_lines[:50])
+            if total_lines > 50:
+                full_body += f"\n• *(Card display capped at 50 lines. Full output in archive / 更多见归档)*"
+            elements.append({
+                "tag": "markdown",
+                "content": f"**📌 Preview (摘要前瞻)**\n{preview}",
+            })
+            elements.append(_collapsible_panel(
+                f"📄 Full Details (完整明细 · {total_lines} lines)",
+                [{"tag": "markdown", "content": full_body}],
+                expanded=False,
+            ))
         return elements
 
+    # 包含多个 ◆ 分区的长命令输出（如 /doctor, /status 等）
+    first_panel = True
     for sec in sections:
         sec = sec.strip()
         if not sec:
@@ -163,13 +201,24 @@ def _beautify_unified(cmd: str, clean_text: str) -> list[dict]:
         formatted_body = [l for l in formatted_body if l]
         if not formatted_body:
             continue
-        content_body = "\n".join(formatted_body[:25])
-        if len(formatted_body) > 25:
-            content_body += "\n• *(Output truncated in card / 已截断展示)*"
-        elements.append({
-            "tag": "markdown",
-            "content": f"**📌 {title}**\n{content_body}",
-        })
+
+        has_err = any("🔴" in l or "✗" in l for l in formatted_body)
+        has_warn = any("⚠️" in l or "⚠" in l for l in formatted_body)
+        status_icon = "🔴" if has_err else ("⚠️" if has_warn else "🟢")
+
+        # 展开逻辑：首个分区或存在异常的分区默认展开，其他折叠保持卡片紧凑
+        should_expand = first_panel or has_err
+        first_panel = False
+
+        content_body = "\n".join(formatted_body[:35])
+        if len(formatted_body) > 35:
+            content_body += f"\n• *(Section display capped at 35 items. Full output in archive)*"
+
+        elements.append(_collapsible_panel(
+            f"{status_icon} {title} ({len(formatted_body)} items)",
+            [{"tag": "markdown", "content": content_body}],
+            expanded=should_expand,
+        ))
     return elements
 
 
