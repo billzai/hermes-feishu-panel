@@ -103,7 +103,7 @@ I18N = {
     "zh": {
         "title": "Hermes 控制面板",
         "quick_actions": "⚡ 快捷操作",
-        "switch_lang_btn": "🇨🇳 CN",
+        "switch_lang_btn": "🌐 CN",
         "switch_lang_toast": "已切换为简体中文 / Switched to Chinese",
         "back": "⬅ 返回",
         "home": "🏠 首页",
@@ -152,7 +152,7 @@ I18N = {
     "en": {
         "title": "Hermes Control Panel",
         "quick_actions": "⚡ Quick Actions",
-        "switch_lang_btn": "🇬🇧 EN",
+        "switch_lang_btn": "🌐 EN",
         "switch_lang_toast": "已切换为英文 / Switched to English",
         "back": "⬅ Back",
         "home": "🏠 Home",
@@ -968,7 +968,7 @@ def _nav_row_for_subpage(lang: str = "zh") -> dict:
                 "width": "weighted",
                 "weight": 1,
                 "vertical_align": "center",
-                "horizontal_align": "left",
+                "horizontal_align": "right",
                 "elements": [_nav_btn(L["home"], "/card/root", "default")],
             },
         ],
@@ -980,13 +980,15 @@ def _nav_row_for_deep_page(parent_target: str, extra_actions: list | None = None
 
     def _make_column_set(btns: list[dict]) -> dict:
         columns = []
-        for btn in btns:
+        n = len(btns)
+        for idx, btn in enumerate(btns):
+            align = "left" if idx == 0 else ("right" if idx == n - 1 else "center")
             columns.append({
                 "tag": "column",
                 "width": "weighted",
                 "weight": 1,
                 "vertical_align": "center",
-                "horizontal_align": "left",
+                "horizontal_align": align,
                 "elements": [btn],
             })
         return {"tag": "column_set", "flex_mode": "bisect", "columns": columns}
@@ -1018,13 +1020,15 @@ def _cc_category_grid(buttons: list[dict]) -> list[dict]:
     for i in range(0, len(buttons), 2):
         pair = buttons[i:i + 2]
         cols = []
-        for b in pair:
+        n = len(pair)
+        for idx, b in enumerate(pair):
+            align = "left" if idx == 0 else "right"
             cols.append({
                 "tag": "column",
                 "width": "weighted",
                 "weight": 1,
                 "vertical_align": "center",
-                "horizontal_align": "left",
+                "horizontal_align": align,
                 "elements": [b],
             })
         if len(cols) == 1:
@@ -1033,6 +1037,7 @@ def _cc_category_grid(buttons: list[dict]) -> list[dict]:
                 "width": "weighted",
                 "weight": 1,
                 "vertical_align": "center",
+                "horizontal_align": "right",
                 "elements": [],
             })
         elements.append({
