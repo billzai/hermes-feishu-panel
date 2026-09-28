@@ -194,10 +194,11 @@ systemctl --user restart hermes-gateway
 - 目录权限严格设为 `0700`（仅 Agent 宿主用户有权读写）；
 - 7 天 TTL 自动清理仅作用于该沙箱目录，彻底消除利用共享 `/tmp` 提权或信息泄露的漏洞。
 
-### 2. 读写分离的 Fail-Closed RBAC 门禁
-- **只读查询放行**：会话成员可触发只读命令查询系统健康度与版本；
-- **写操作强门禁**：切换模型（`confirm_switch:`）、修改参数（`set_cfg:`）和开启免审模式（`/yolo`）必须通过 `_is_admin()` 校验；
-- **默认闭合原则**：若部署者未配置环境变量 `FEISHU_ADMINS`，写操作直接拦截并提示无权，绝不默认放行。
+### 2. 全员菜单浏览与所有者专属执行（Owner-Only Execution）
+- **全员开放菜单浏览**：控制面板支持发到多人群聊。群内任意成员均可自由点击翻阅一级、二级、三级菜单（如查看支持的模型列表、参数备选项与指南说明），并可自由展开/折叠面板，绝不报权限错误；
+- **执行命令与修改配置严格限定所有者**：所有真实命令执行（`/status`、`/doctor`、`/logs` 等）、会话操作（`/new`、`/stop` 等）、模型切换确认与参数修改**100% 仅限宿主实例所有者本人**操作；
+- **他人点击一律拦截**：非所有者点击任何执行类按钮，卡片绝不拉起本地进程或更改配置，直接弹出拦截 Toast：`"⛔ Operation restricted to instance owner / 仅限实例所有者执行操作"`；
+- **所有者配置方式**：在 `~/.hermes/.env` 中配置 `FEISHU_ADMINS=ou_xxxx` 指定所有者 Open ID；若未配置，私聊首次交互者自动认领，群聊坚决保持 Fail-Closed。
 
 ### 3. 入参白名单防御
 - 切换模型前校验目标模型是否在当前生效的 `catalog` 范围内；
@@ -246,7 +247,7 @@ Operating autonomous AI agents via messaging platforms usually suffers from 4 ma
 - **⚡ PTY Live Terminal Streaming**: Uses system pseudo-terminals (`pty.openpty()`) to capture live process output, refreshed smoothly at 0.8s intervals.
 - **💓 Active Silent Heartbeat**: During long silent operations (e.g. SQLite snapshot verification), active heartbeats tick every 1.0s to confirm background vitality.
 - **⏱️ Adaptive Timeout Tiers**: Tiered execution budgets (120s for `/doctor`, 60s for `/security`, 35s default) prevent premature termination.
-- **🛡️ Fail-Closed RBAC Security**: Read-only queries are permissive to chat members. State-changing actions (`confirm_switch`, `set_cfg`, `/yolo`, `/stop`) strictly require `FEISHU_ADMINS`.
+- **🛡️ Owner-Only Execution & Public Browsing**: Everyone can navigate menus, switch options, and fold drawers. Command execution, model switching, and settings are strictly locked to the instance owner (`FEISHU_ADMINS`). Non-owners clicking execution buttons are safely blocked with zero host processes spawned.
 - **🔒 Safe Atomic Config Updates**: Uses official `hermes config set <key> <val> --yes` CLI with parameter whitelisting. Preserves all YAML comments.
 - **📦 Isolated Sandboxed Storage**: Process outputs are stored under `~/.hermes/plugin-data/feishu-command-palette/` (0700) with a 7-day TTL auto-purge. Zero `/tmp` pollution.
 - **🌐 English-First Bilingual UI**: Standardized English UI with concise bilingual subtitles for seamless global usage.

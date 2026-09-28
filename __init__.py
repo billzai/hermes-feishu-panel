@@ -602,46 +602,72 @@ def _redeem_token(tok: str, open_id: str) -> Optional[dict]:
         return rec
 
 
-def _get_admin_open_ids(adapter: Any = None) -> set[str]:
-    admins = set()
-    env_admins = os.environ.get("FEISHU_ADMINS", "").strip()
-    if env_admins:
-        admins.update(a.strip() for a in env_admins.split(",") if a.strip())
+def _get_owner_open_ids(adapter: Any = None) -> set[str]:
+    owners = set()
+    for env_key in ("FEISHU_ADMINS", "FEISHU_OWNER_ID"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            for item in val.split(","):
+                clean = item.strip()
+                if clean and clean != "*":  # 严禁通配符，防止误配置导致全员可执行
+                    owners.add(clean)
     if adapter is not None:
         adapter_admins = getattr(adapter, "_admins", None)
         if isinstance(adapter_admins, (list, set, tuple)):
-            admins.update(str(a).strip() for a in adapter_admins if a)
-    return admins
+            for a in adapter_admins:
+                clean = str(a).strip()
+                if clean and clean != "*":
+                    owners.add(clean)
+    owner_file = PLUGIN_DATA_DIR / "owner.json"
+    try:
+        if owner_file.exists():
+            data = json.loads(owner_file.read_text(encoding="utf-8"))
+            saved = str(data.get("owner_id", "")).strip()
+            if saved and saved != "*":
+                owners.add(saved)
+    except Exception:
+        pass
+    return owners
 
 
-def _is_admin(open_id: str, adapter: Any = None) -> bool:
-    """Strict fail-closed admin verification for write/dangerous actions."""
+def _record_default_owner_if_empty(open_id: str, is_p2p: bool = False) -> None:
+    """当未配置任何 Owner 时，如果用户在私聊会话中与机器人交互，自动认领为默认 Owner。群聊中绝不自动认领。"""
+    if not open_id or not is_p2p:
+        return
+    owners = _get_owner_open_ids()
+    if owners:
+        return
+    try:
+        owner_file = PLUGIN_DATA_DIR / "owner.json"
+        owner_file.write_text(json.dumps({
+            "owner_id": open_id,
+            "claimed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "note": "Automatically claimed in private P2P session on first interaction."
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        owner_file.chmod(0o600)
+        logger.info("[command-palette] Default owner automatically claimed: %s", open_id)
+    except Exception as e:
+        logger.warning("[command-palette] failed to save default owner: %s", e)
+
+
+def _is_owner(open_id: str, adapter: Any = None) -> bool:
+    """严格 Fail-Closed 所有者鉴权：仅实例所有者可执行命令与写操作"""
     normalized = str(open_id or "").strip()
-    if not normalized:
+    if not normalized or normalized == "*":
         return False
-    admins = _get_admin_open_ids(adapter)
-    if not admins:
+    owners = _get_owner_open_ids(adapter)
+    if not owners:
         return False
-    return "*" in admins or normalized in admins
+    return normalized in owners
+
+
+# 保持 _is_admin 与 _is_operator_allowed 兼容别名
+_is_admin = _is_owner
 
 
 def _is_operator_allowed(open_id: str, adapter: Any = None) -> bool:
-    """Check if operator is allowed to trigger read-only cards."""
-    normalized = str(open_id or "").strip()
-    if not normalized:
-        return False
-    admins = _get_admin_open_ids(adapter)
-    allowed = set(admins)
-    env_allowed = os.environ.get("FEISHU_ALLOWED_USERS", "").strip()
-    if env_allowed:
-        allowed.update(a.strip() for a in env_allowed.split(",") if a.strip())
-    if adapter is not None:
-        group_allowed = getattr(adapter, "_allowed_group_users", None)
-        if isinstance(group_allowed, (list, set, tuple)):
-            allowed.update(str(u).strip() for u in group_allowed if u)
-    if not allowed:
-        return True
-    return "*" in allowed or normalized in allowed
+    """卡片浏览与菜单翻阅：全员允许查看（只读展示）"""
+    return True
 
 
 _STATIC_OAUTH_MODELS: dict[str, list[str]] = {
@@ -1447,8 +1473,10 @@ def dispatch_palette_action(action_value: dict, cid: str, mid: str, open_id: str
     if ac == "exec_cancel":
         return _root_card(), "Action cancelled / 操作已取消", "info"
 
-    # 5. Output View & Copy Actions
+    # 5. Output View & Copy Actions (Owner Only)
     if ac.startswith("copy_output:"):
+        if not _is_owner(open_id, adapter):
+            return None, "⛔ Only instance owner can view/copy output / 仅限实例所有者查看明细", "error"
         raw_path = ac[len("copy_output:"):].strip()
         safe = _safe_saved_output_path(raw_path)
         if not safe:
@@ -1458,6 +1486,8 @@ def dispatch_palette_action(action_value: dict, cid: str, mid: str, open_id: str
         return card, "Expanded full text, copy as needed / 请长按或选中复制", "info"
 
     if ac.startswith("show_result:"):
+        if not _is_owner(open_id, adapter):
+            return None, "⛔ Only instance owner can view output / 仅限实例所有者查看明细", "error"
         raw_path = ac[len("show_result:"):].strip()
         safe = _safe_saved_output_path(raw_path)
         if not safe:
@@ -1471,17 +1501,31 @@ def dispatch_palette_action(action_value: dict, cid: str, mid: str, open_id: str
                                              saved_path=safe, status_text="Archived Result (已归档结果)")
         return card, "Result loaded / 结果已加载", "info"
 
-    # 6. Navigation Actions
+    # 6. Navigation Actions (Open to everyone for browsing menus)
     if ac.startswith("nav:"):
         card = _nav(ac, sk)
         return card, "", "info"
 
-    # 7. Command Execution Routing
+    # 7. Command Execution & Menu Viewing Routing
     if ac.startswith("cmd:"):
         cmd = ac[4:].strip()
         meta = _CMD_META.get(cmd)
         if not meta:
             return None, f"Unknown command {cmd} / 未知命令", "error"
+
+        # ── 7.1 菜单展示类命令：所有人均可点击查看（只读展示，不执行进程） ──
+        if cmd == "/model":
+            return _build_model_card(sk), "", "info"
+
+        if meta.get("options"):
+            return _build_options_card(cmd), "", "info"
+
+        if cmd in GUIDE_CMDS:
+            return _build_guide_card(cmd), "", "info"
+
+        # ── 7.2 执行类命令与会话操作：严格仅限实例所有者（Owner）！其他人一律无效 ──
+        if not _is_owner(open_id, adapter):
+            return None, f"⛔ Only instance owner can execute {cmd} / 仅限实例所有者执行操作", "error"
 
         # Cooldown Check (3.0s per user per command)
         global _cooldown_check_counter
@@ -1498,18 +1542,7 @@ def dispatch_palette_action(action_value: dict, cid: str, mid: str, open_id: str
             for k in expired:
                 del _cmd_cooldown[k]
 
-        if cmd == "/model":
-            return _build_model_card(sk), "", "info"
-
-        if meta.get("options"):
-            return _build_options_card(cmd), "", "info"
-
-        if cmd in GUIDE_CMDS:
-            return _build_guide_card(cmd), "", "info"
-
         if meta.get("danger"):
-            if not _is_admin(open_id, adapter):
-                return None, "⛔ Permission denied: Admin privileges required / 需要管理员权限", "error"
             tok = _mint_token(cid, open_id, mid, cmd, "")
             return _build_exec_confirm_card(cmd, "", tok), "Confirmation required / 请二次确认", "warning"
 
@@ -1619,8 +1652,8 @@ def _on_msg(event=None, gateway=None, **kw) -> Optional[dict]:
         if not _check_lark_cli():
             logger.error("[command-palette] lark-cli is not installed in PATH")
             return None
-        if not _is_operator_allowed(sender_open_id):
-            return {"action": "skip", "reason": "command-palette:unauthorized"}
+        chat_type = getattr(src, "chat_type", "") or ""
+        _record_default_owner_if_empty(sender_open_id, is_p2p=(chat_type in ("p2p", "dm")))
         _send_root_card(cid, _root_card())
         return {"action": "skip", "reason": "command-palette:card"}
 
