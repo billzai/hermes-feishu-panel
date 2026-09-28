@@ -7,7 +7,7 @@
 <!-- Badge Row 1: Core Info -->
 [![GitHub](https://img.shields.io/badge/GitHub-billzai%2Fhermes--feishu--panel-181717?logo=github)](https://github.com/billzai/hermes-feishu-panel)
 [![Gitee](https://img.shields.io/badge/Gitee-biu__zai%2Fhermes--feishu--panel-C71D23?logo=gitee)](https://gitee.com/biu_zai/hermes-feishu-panel)
-[![Version](https://img.shields.io/badge/version-1.3.0-orange)](https://github.com/billzai/hermes-feishu-panel)
+[![Version](https://img.shields.io/badge/version-1.4.0-orange)](https://github.com/billzai/hermes-feishu-panel)
 [![PR Pending](https://img.shields.io/badge/PR-Under_Review_%23122519-yellow?logo=github)](https://github.com/NousResearch/hermes-agent/pull/122519)
 
 <!-- Badge Row 2: Tech Stack & Compatibility -->
@@ -64,6 +64,7 @@
 
 ## 2. 核心特性矩阵
 
+- **🌐 首页中英文瞬时切换 (In-Place Language Toggle)**：状态栏集成 `[ 🌐 English ]` / `[ 🌐 简体中文 ]` 极简切换按钮，默认纯中文（4字大字体，零截断），点击毫秒级原地重绘为纯英文，全链路二级菜单、选项卡与报告完美跟随解耦。
 - **🎛️ 单卡片原地流转 (In-Place Lifecycle)**：从一级菜单导航、二级选项卡选择，到终端流式预览与最终报告，100% 在当前卡片内原地重绘，零新增消息骚扰。
 - **📂 原生可折叠抽屉 (Native Collapsible Panels)**：全面适配飞书原生 `collapsible_panel` 组件。长输出（如 `/doctor` 的 17 项诊断）自动收纳为折叠抽屉，异常模块（`🔴`）与概览智能默认展开，健康模块默认收起，卡片高度永久保持在一屏内。
 - **⚡ PTY 虚拟终端流式 (Terminal Streaming)**：采用系统伪终端（`pty.openpty()`）实时捕获子进程 stdout，配合 0.8s 滑动窗口动态节流刷新，拒绝黑盒死等。
@@ -242,6 +243,7 @@ Operating autonomous AI agents via messaging platforms usually suffers from 4 ma
 
 ## 2. Key Features
 
+- **🌐 In-Place Language Switching**: Seamless `[ 🌐 English ]` / `[ 🌐 简体中文 ]` toggle directly on the status bar. Pure Chinese by default (zero truncation on mobile), switchable to pure English instantly with full sub-menu and report localization.
 - **🎛️ In-Place Lifecycle Transitions**: Root menus, sub-options, live streaming previews, and final reports all render within the same card. Zero spam.
 - **📂 Native Collapsible Panels**: Deep integration with Lark's native `collapsible_panel`. Complex outputs (e.g. `/doctor`'s 17 sections) fold into clean drawers. Warnings/errors expand automatically; healthy sections collapse by default.
 - **⚡ PTY Live Terminal Streaming**: Uses system pseudo-terminals (`pty.openpty()`) to capture live process output, refreshed smoothly at 0.8s intervals.
