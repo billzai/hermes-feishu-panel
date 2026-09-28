@@ -767,36 +767,7 @@ def _get_owner_open_ids(adapter: Any = None) -> set[str]:
                 clean = str(a).strip()
                 if clean and clean != "*":
                     owners.add(clean)
-    owner_file = PLUGIN_DATA_DIR / "owner.json"
-    try:
-        if owner_file.exists():
-            data = json.loads(owner_file.read_text(encoding="utf-8"))
-            saved = str(data.get("owner_id", "")).strip()
-            if saved and saved != "*":
-                owners.add(saved)
-    except Exception:
-        pass
     return owners
-
-
-def _record_default_owner_if_empty(open_id: str, is_p2p: bool = False) -> None:
-    """当未配置任何 Owner 时，如果用户在私聊会话中与机器人交互，自动认领为默认 Owner。群聊中绝不自动认领。"""
-    if not open_id or not is_p2p:
-        return
-    owners = _get_owner_open_ids()
-    if owners:
-        return
-    try:
-        owner_file = PLUGIN_DATA_DIR / "owner.json"
-        owner_file.write_text(json.dumps({
-            "owner_id": open_id,
-            "claimed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "note": "Automatically claimed in private P2P session on first interaction."
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-        owner_file.chmod(0o600)
-        logger.info("[command-palette] Default owner automatically claimed: %s", open_id)
-    except Exception as e:
-        logger.warning("[command-palette] failed to save default owner: %s", e)
 
 
 def _is_owner(open_id: str, adapter: Any = None) -> bool:
@@ -1880,8 +1851,6 @@ def _on_msg(event=None, gateway=None, **kw) -> Optional[dict]:
         if not _check_lark_cli():
             logger.error("[command-palette] lark-cli is not installed in PATH")
             return None
-        chat_type = getattr(src, "chat_type", "") or ""
-        _record_default_owner_if_empty(sender_open_id, is_p2p=(chat_type in ("p2p", "dm")))
         sk = _skey(cid, sender_open_id)
         _send_root_card(cid, _root_card(sk))
         return {"action": "skip", "reason": "command-palette:card"}
