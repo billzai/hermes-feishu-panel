@@ -1,24 +1,13 @@
-"""Hermes 命令面板 - 工业级美化与原生全量闭环版 (v7.3)
+"""Hermes Feishu Command Palette (feishu-command-palette) v1.2.0
 
-版本演进亮点：
-1. 全景扩充命令矩阵（由 18 个暴增至 32 个核心与高级命令）：
-   - 会话类新增：/usage (真实账户剩余配额与重置时间)、/background (后台长任务启动引导与模板)；
-   - 配置类新增：/personality (14 种预置 AI 人格秒切选项卡！)、/codex-runtime；
-   - 工具研发新增：/diff (工作区 Git 变更统计)、/security (供应链安全审计)、/memory (记忆库状态与插件审查)、/bundles (技能捆绑包)；
-   - 系统信息新增：/config (全量配置概览)、/whoami (当前身份与权限)、/help (命令速查)。
-2. 全局导航系统标准化重构（解决“某些界面缺少返回上一级按钮”）：
-   - L1 根卡片（主菜单）：完全删除底部的提示文字，界面干净干练；
-   - L2 二级分类菜单（会话/配置/工具/信息）：底部统一并排提供 [ ⬅ 返回上一级 ] 与 [ 🏠 返回主菜单 ]；
-   - L3 三级子界面（选项卡/模型切换/执行结果/高危确认/指引卡）：底部统一提供：
-     [ ⬅ 返回上一级 ]（精准回退所属分类） + [ 🏠 返回主菜单 ]（一键返回面板首页）；
-     结果卡同时并排附带 [ 🔁 再次执行 ]。
-3. 彻底治愈全部命令物理路径：
-   - /version 严格绑定为 ["hermes", "--version"]；
-   - /context 严格绑定为 ["hermes", "prompt-size"]；
-   - /debug 严格绑定为 ["hermes", "debug", "share", "--local"]；
-   - /diff 严格绑定为 ["git", "-C", hermes_home, "diff", "--stat"]。
-4. 纯本地 0.5 毫秒全量 Provider 发现：集成 auth.json + config.yaml，支持 openai-codex、xai-oauth、copilot 等全部登录态。
-5. 纯本地 2 毫秒模型原子切换：绝不发送破坏性 SIGHUP，网关长连接永久在线稳固。
+Interactive single-card control panel to dispatch Hermes slash commands directly.
+
+Disclosure:
+Answers the Feishu /card text with a control card sent through the external
+lark-cli binary; button clicks run a fixed table of hermes ... CLI subcommands
+locally and post their output (logs, sessions, redacted config/auth listings)
+into the chat, and can write model/provider and agent.* settings including
+agent.yolo; reads auth.json for provider names.
 """
 
 from __future__ import annotations
@@ -28,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -39,16 +29,26 @@ import yaml
 
 logger = logging.getLogger("command-palette")
 
+# Global Settings & Experiments
 STREAMING_ENABLED = True
-STREAM_PATCH_INTERVAL = 0.8  # 飞书卡片动态刷新最小间隔秒数，保护 API 频控
+STREAM_PATCH_INTERVAL = 0.8  # Minimal seconds between streaming card patches (protects Lark QPS)
+_DEFAULT_CMD_TIMEOUT = 35
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 AUTH_PATH = HERMES_HOME / "auth.json"
 INSTALL_PATH = HERMES_HOME / "hermes-agent"
 
+# Dedicated, Sandboxed Data Directory (Strictly NO /tmp usage)
+PLUGIN_DATA_DIR = HERMES_HOME / "plugin-data" / "feishu-command-palette"
+try:
+    PLUGIN_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PLUGIN_DATA_DIR.chmod(0o700)
+except Exception as e:
+    logger.warning("[command-palette] failed to initialize plugin-data directory: %s", e)
+
 # ════════════════════════════════════════════════════════════════════════════
-# 1. 结构化美化与持久化引擎
+# 1. Output Formatting, Sandboxed Storage & Cleanup
 # ════════════════════════════════════════════════════════════════════════════
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
@@ -58,12 +58,28 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
 
 
+def _safe_saved_output_path(value: str) -> str | None:
+    """Validate archive path: strictly within PLUGIN_DATA_DIR, no directory traversal."""
+    if not value or not isinstance(value, str):
+        return None
+    val = value.strip()
+    if ".." in val:
+        return None
+    try:
+        p = Path(val).resolve()
+        base = PLUGIN_DATA_DIR.resolve()
+        if not str(p).startswith(str(base)) or not p.is_file():
+            return None
+        return str(p)
+    except Exception:
+        return None
+
+
 def _infer_cmd_from_saved_path(saved_path: str) -> str:
-    """通过文件名前缀精确匹配 CLI_CMDS 命令，比 split 下标更可靠。"""
     safe = _safe_saved_output_path(saved_path)
     if not safe:
         return ""
-    basename = Path(safe).stem  # e.g. hermes_doctor_20260924_223000
+    basename = Path(safe).stem
     for cmd in CLI_CMDS:
         prefix = "hermes_" + cmd.strip("/").replace(" ", "_") + "_"
         if basename.startswith(prefix):
@@ -71,144 +87,94 @@ def _infer_cmd_from_saved_path(saved_path: str) -> str:
     return ""
 
 
-def _safe_saved_output_path(value: str) -> str | None:
-    """验证并清理归档文件路径，仅允许 /tmp/hermes_ 开头的合法路径。"""
-    if not value or not isinstance(value, str):
-        return None
-    val = value.strip()
-    if ".." in val or not val.startswith("/tmp/hermes_"):
-        return None
-    try:
-        p = Path(val).resolve()
-        if p.parent != Path("/tmp") or not p.name.startswith("hermes_"):
-            return None
-        return str(p)
-    except Exception:
-        return None
-
-
 def _read_saved_output(path: str) -> tuple[str, str | None]:
-    """安全读取归档文件内容，返回 (content, err_msg)。"""
     safe = _safe_saved_output_path(path)
     if not safe:
-        return "", "非法归档路径"
+        return "", "Invalid archive path / 非法归档路径"
     try:
         p = Path(safe)
         if not p.exists():
-            return "", "归档文件不存在"
+            return "", "Archive file does not exist / 归档文件不存在"
         if not p.is_file():
-            return "", "目标不是普通文件"
-        content = p.read_text(encoding="utf-8", errors="replace")
-        return content, None
+            return "", "Target is not a regular file / 目标不是普通文件"
+        return p.read_text(encoding="utf-8", errors="replace"), None
     except Exception as e:
-        return "", f"读取文件失败: {e}"
+        return "", f"Failed to read file / 读取失败: {e}"
 
 
 def _format_unified_line(line: str) -> str:
-    """按 Doctor 风格格式化单行文本。"""
     s = line.strip()
     if not s:
         return ""
     if s.startswith("✓"):
         msg = s.lstrip("✓").strip()
-        return f"🟢 {msg}" if msg else "🟢"
+        return f"🟢 {msg}"
     if s.startswith("⚠") or s.startswith("!"):
         msg = s.lstrip("⚠!").strip()
-        return f"⚠️ <font color='orange'>{msg}</font>" if msg else "⚠️"
-    if s.startswith("✗"):
-        msg = s.lstrip("✗").strip()
-        return f"🔴 <font color='red'>**{msg}**</font>" if msg else "🔴"
-    if s.startswith("→"):
-        msg = s.lstrip("→").strip()
-        return f"　↳ *{msg}*" if msg else "　↳"
-
-    content = s
-    if content.startswith(("- ", "• ", "* ")) and len(content) > 2:
-        content = content[2:].strip()
-
-    if ":" in content and not content.startswith(("http://", "https://")):
-        k, _, v = content.partition(":")
-        k = k.strip()
-        v = v.strip()
-        if "✓" in v:
-            v = "🟢 " + v.replace("✓", "").strip()
-        elif "✗" in v:
-            v = "🔴 " + v.replace("✗", "").strip()
-        if v:
-            return f"• **{k}**: {v}"
-        return f"• **{k}**"
-
+        return f"⚠️ {msg}"
+    if s.startswith("✗") or s.startswith("×"):
+        msg = s.lstrip("✗×").strip()
+        return f"🔴 {msg}"
+    if re.match(r"^[A-Za-z0-9_\-\.\[\]/]+\s*:\s+", s):
+        parts = s.split(":", 1)
+        k, v = parts[0].strip(), parts[1].strip()
+        return f"• **{k}**: {v}"
+    if s.startswith("- ") or s.startswith("* "):
+        clean_s = s[2:].strip()
+        return f"• {clean_s}" if clean_s else ""
     clean_s = s.lstrip("-•* ").strip()
     return f"• {clean_s}" if clean_s else ""
 
 
 def _beautify_unified(cmd: str, clean_text: str) -> list[dict]:
-    """统一 Doctor 风格渲染引擎，按 ◆ 分段渲染，无分段时创建 📌 查询详情。"""
     elements: list[dict] = []
     if not clean_text:
         elements.append({
             "tag": "markdown",
-            "content": "**📌 查询详情**\n• (无输出内容)",
+            "content": "**📌 Output (执行结果)**\n• *(No output returned / 无输出)*",
         })
         return elements
 
-    if "◆" in clean_text:
-        raw_sections = re.split(r"(?:^|\n)(?=◆\s*)", clean_text)
-        sections = [s.strip() for s in raw_sections if s.strip()]
-        for sec in sections[:12]:
-            sec_lines = sec.splitlines()
-            if not sec_lines:
-                continue
-            if sec_lines[0].startswith("◆"):
-                header = sec_lines[0].lstrip("◆").strip()
-                body_lines = sec_lines[1:]
-            else:
-                header = "查询详情"
-                body_lines = sec_lines
-            items = []
-            for l in body_lines:
-                fmt = _format_unified_line(l)
-                if fmt:
-                    items.append(fmt)
-            if items:
-                if len(items) > 25:
-                    shown = items[:25]
-                    shown.append(f"• *(更多 {len(items) - 25} 行见归档)*")
-                    content = f"**📌 {header}**\n" + "\n".join(shown)
-                else:
-                    content = f"**📌 {header}**\n" + "\n".join(items)
-                elements.append({"tag": "markdown", "content": content})
-    else:
-        items = []
-        for l in clean_text.splitlines():
-            fmt = _format_unified_line(l)
-            if fmt:
-                items.append(fmt)
-        if not items:
-            items = ["• (无有效内容)"]
-        if len(items) > 30:
-            shown = items[:30]
-            shown.append(f"• *(更多 {len(items) - 30} 行见归档)*")
-            content = "**📌 查询详情**\n" + "\n".join(shown)
-        else:
-            content = "**📌 查询详情**\n" + "\n".join(items)
-        elements.append({"tag": "markdown", "content": content})
+    sections = re.split(r"(?m)^(?=◆ )", clean_text)
+    if len(sections) <= 1:
+        lines = clean_text.splitlines()
+        formatted_lines = [_format_unified_line(l) for l in lines]
+        formatted_lines = [l for l in formatted_lines if l]
+        content_body = "\n".join(formatted_lines[:45])
+        if len(formatted_lines) > 45:
+            content_body += "\n• *(Output truncated in card / 已截断展示)*"
+        elements.append({
+            "tag": "markdown",
+            "content": f"**📌 Details (查询详情)**\n{content_body}",
+        })
+        return elements
 
+    for sec in sections:
+        sec = sec.strip()
+        if not sec:
+            continue
+        sec_lines = sec.splitlines()
+        header_line = sec_lines[0].strip()
+        title = header_line.lstrip("◆").strip() or "Details (详情)"
+        body_lines = sec_lines[1:]
+        if not body_lines:
+            continue
+        formatted_body = [_format_unified_line(l) for l in body_lines]
+        formatted_body = [l for l in formatted_body if l]
+        if not formatted_body:
+            continue
+        content_body = "\n".join(formatted_body[:25])
+        if len(formatted_body) > 25:
+            content_body += "\n• *(Output truncated in card / 已截断展示)*"
+        elements.append({
+            "tag": "markdown",
+            "content": f"**📌 {title}**\n{content_body}",
+        })
     return elements
 
 
 def parse_and_beautify_output(cmd: str, raw_text: str, max_chars_inline: int = 1500) -> tuple[list[dict], str]:
-    """
-    统一结果美化引擎：
-    1. 清除 ANSI 颜色与终端盒子边框 (┌─┐│└─┘)；
-    2. 全量保存清理后文本至 /tmp/hermes_<cmd>_<timestamp>.txt；
-    3. 顶部摘要展示状态标记、字符数与行数；
-    4. 统一 Doctor 风格模块化美化渲染；
-    5. 底部归档路径单独行展示；
-    6. 返回 (elements, saved_path)。
-    """
-    clean = _strip_ansi(raw_text).strip()
-
+    clean = _strip_ansi(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
     filtered_lines = []
     for line in clean.splitlines():
         s = line.strip()
@@ -221,38 +187,50 @@ def parse_and_beautify_output(cmd: str, raw_text: str, max_chars_inline: int = 1
 
     ts_str = time.strftime("%Y%m%d_%H%M%S")
     safe_cmd = cmd.strip("/").replace(" ", "_") or "output"
-    tmp_path = Path(f"/tmp/hermes_{safe_cmd}_{ts_str}.txt")
+    saved_path = PLUGIN_DATA_DIR / f"hermes_{safe_cmd}_{ts_str}.txt"
     try:
-        tmp_path.write_text(clean_text, encoding="utf-8")
+        saved_path.write_text(clean_text, encoding="utf-8")
     except Exception as e:
         logger.warning("[command-palette] write saved output failed: %s", e)
 
     line_count = len(clean_text.splitlines()) if clean_text else 0
     char_count = len(clean_text)
     fails = len(re.findall(r"^[ \t]*✗", clean_text, re.M))
-    status_mark = "🔴 包含异常" if fails > 0 else "🟢 执行成功"
+    status_mark = "🔴 Exceptions Found (包含异常)" if fails > 0 else "🟢 Success (执行成功)"
 
     top_summary = {
         "tag": "markdown",
-        "content": f"{status_mark}  |  📊 `{char_count}` 字符  |  📄 `{line_count}` 行",
+        "content": f"{status_mark}  |  📊 `{char_count}` chars  |  📄 `{line_count}` lines",
     }
-
     sub_elements = _beautify_unified(cmd, clean_text)
-
     bottom_archive = {
         "tag": "markdown",
-        "content": f"📄 **完整归档路径**\n`{tmp_path}`",
+        "content": f"📄 **Archive Path (归档路径)**\n`{saved_path}`",
     }
 
     elements = [top_summary]
     elements.extend(sub_elements)
     elements.append(bottom_archive)
+    return elements, str(saved_path)
 
-    return elements, str(tmp_path)
+
+def _cleanup_old_outputs() -> None:
+    """Clean up archived outputs older than 7 days inside PLUGIN_DATA_DIR only."""
+    try:
+        cutoff = time.time() - 7 * 86400
+        if PLUGIN_DATA_DIR.exists():
+            for p in PLUGIN_DATA_DIR.glob("hermes_*.txt"):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 2. CommandBridgeRunner — 本地命令直驱器
+# 2. Command Execution Engine & PTY Streaming
 # ════════════════════════════════════════════════════════════════════════════
 
 class CmdResult:
@@ -279,18 +257,17 @@ def run_subprocess(argv: list[str], *, timeout: int, input_text: str | None = No
             start_new_session=True,
         )
     except FileNotFoundError:
-        return CmdResult(False, stderr=f"可执行文件不存在: {argv[0]}", exit_code=127)
-    except Exception as e:  # noqa: BLE001
-        return CmdResult(False, stderr=f"进程拉起失败: {e}", exit_code=126)
+        return CmdResult(False, stderr=f"Executable not found: {argv[0]}", exit_code=127)
+    except Exception as e:
+        return CmdResult(False, stderr=f"Failed to start process: {e}", exit_code=126)
     try:
         out, err = proc.communicate(input=input_text, timeout=timeout)
         is_ok = (proc.returncode == 0) or (argv[1:2] == ["doctor"] and bool(out.strip()))
-        return CmdResult(is_ok, out or "", err or "",
-                         proc.returncode or 0, False, time.monotonic() - start)
+        return CmdResult(is_ok, out or "", err or "", proc.returncode or 0, False, time.monotonic() - start)
     except subprocess.TimeoutExpired:
         try:
             proc.kill()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         out, err = proc.communicate()
         return CmdResult(False, out or "", err or "", -9, True, time.monotonic() - start)
@@ -314,18 +291,20 @@ def run_subprocess_streaming(argv: list[str], *, timeout: int,
     try:
         proc = subprocess.Popen(
             argv,
-            stdin=slave, stdout=slave, stderr=slave,
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
             close_fds=True,
             start_new_session=True,
         )
     except FileNotFoundError:
         os.close(master)
         os.close(slave)
-        return CmdResult(False, stderr=f"可执行文件不存在: {argv[0]}", exit_code=127)
+        return CmdResult(False, stderr=f"Executable not found: {argv[0]}", exit_code=127)
     except Exception as e:
         os.close(master)
         os.close(slave)
-        return CmdResult(False, stderr=f"进程拉起失败: {e}", exit_code=126)
+        return CmdResult(False, stderr=f"Failed to start process: {e}", exit_code=126)
 
     os.close(slave)
     out_parts: list[str] = []
@@ -367,17 +346,7 @@ def run_subprocess_streaming(argv: list[str], *, timeout: int,
                     except Exception:
                         pass
             else:
-                # 心跳：无新数据超过 1 秒且进程仍存活时触发
-                now = time.monotonic()
-                if on_tick is not None and now - last_tick >= 1.0 and proc.poll() is None:
-                    last_tick = now
-                    try:
-                        on_tick(now - start)
-                    except Exception:
-                        pass
-
                 if proc.poll() is not None:
-                    # 进程已结束，排尽缓冲区
                     try:
                         while True:
                             rlist2, _, _ = _select.select([master], [], [], 0.05)
@@ -393,56 +362,63 @@ def run_subprocess_streaming(argv: list[str], *, timeout: int,
                                     on_chunk(text, time.monotonic() - start)
                                 except Exception:
                                     pass
-                    except OSError:
+                    except Exception:
                         pass
                     break
-    except Exception:
-        pass
+                else:
+                    now = time.monotonic()
+                    if on_tick is not None and (now - last_tick >= 1.0):
+                        last_tick = now
+                        try:
+                            on_tick(time.monotonic() - start)
+                        except Exception:
+                            pass
+    finally:
+        try:
+            os.close(master)
+        except Exception:
+            pass
 
-    try:
-        os.close(master)
-    except Exception:
-        pass
     proc.wait()
-
-    out = "".join(out_parts)
-    elapsed = time.monotonic() - start
-    is_ok = (proc.returncode == 0) or (argv[1:2] == ["doctor"] and bool(out.strip()))
-    return CmdResult(is_ok, out, "", proc.returncode or 0, False, elapsed)
+    total_elapsed = time.monotonic() - start
+    raw_out = "".join(out_parts)
+    is_ok = (proc.returncode == 0) or (argv[1:2] == ["doctor"] and bool(raw_out.strip()))
+    return CmdResult(is_ok, raw_out, "", proc.returncode or 0, False, total_elapsed)
 
 
 def run_lark(args: list[str], *, timeout: int = 20) -> CmdResult:
     return run_subprocess(["lark-cli", *args], timeout=timeout)
 
 
+def _check_lark_cli() -> bool:
+    return shutil.which("lark-cli") is not None
+
+
 # ════════════════════════════════════════════════════════════════════════════
-# 3. 扩充后的全量命令注册表与从属关系定义（实测 100% 正确命令）
+# 3. Command Registry & Bilingual Metadata (English First)
 # ════════════════════════════════════════════════════════════════════════════
 
-# 命令 Emoji 映射表
 CMD_EMOJI: dict[str, str] = {
-    # session 类
-    "/new":        "🆕",
-    "/stop":       "⏹",
-    "/status":     "📊",
-    "/context":    "📐",
-    "/usage":      "📈",
-    "/sessions":   "📋",
-    "/undo":       "↩",
-    "/retry":      "🔁",
-    "/compress":   "🗜",
-    "/background": "⏳",
-    "/steer":      "🎯",
-    "/goal":       "🏆",
-    # config 类
+    # session
+    "/new":      "🆕",
+    "/stop":     "⏹",
+    "/status":   "📊",
+    "/context":  "📐",
+    "/usage":    "💳",
+    "/sessions": "🗂",
+    "/undo":     "↩️",
+    "/retry":    "🔁",
+    "/compress": "🗜",
+    "/background":"🚀",
+    # config
     "/model":        "🔄",
     "/reasoning":    "🧠",
     "/personality":  "🎭",
-    "/verbose":      "🔧",
+    "/verbose":      "🔊",
     "/yolo":         "⚡",
     "/fast":         "🚀",
     "/codex-runtime":"🖥",
-    # tools 类
+    # tools
     "/diff":     "📝",
     "/doctor":   "🩺",
     "/security": "🔒",
@@ -453,7 +429,7 @@ CMD_EMOJI: dict[str, str] = {
     "/skills":   "📚",
     "/bundles":  "📦",
     "/memory":   "🧠",
-    # info 类
+    # info
     "/version": "ℹ️",
     "/profile": "👤",
     "/config":  "⚙️",
@@ -461,115 +437,82 @@ CMD_EMOJI: dict[str, str] = {
 }
 
 CLI_CMDS: dict[str, dict] = {
-    # 会话查询
-    "/status":   {"label": "系统状态", "cli": ["hermes", "status"]},
-    "/context":  {"label": "上下文分析", "cli": ["hermes", "prompt-size"]},
-    "/usage":    {"label": "配额用量", "cli": ["hermes", "usage"]},
-    "/sessions": {"label": "历史会话", "cli": ["hermes", "sessions", "list", "--limit", "10"]},
-    # 工具研发（部分命令配置独立超时）
-    "/diff":     {"label": "代码差异", "cli": ["git", "-C", str(INSTALL_PATH), "diff", "--stat"], "timeout": 45},
-    "/doctor":   {"label": "健康诊断", "cli": ["hermes", "doctor"], "timeout": 120},
-    "/debug":    {"label": "调试摘要", "cli": ["hermes", "debug", "share", "--local"], "timeout": 45},
-    "/security": {"label": "安全审计", "cli": ["hermes", "security", "audit"], "timeout": 60},
-    "/logs":     {"label": "网关日志", "cli": ["hermes", "logs", "gateway", "-n", "40"]},
-    "/cron":     {"label": "定时任务", "cli": ["hermes", "cron", "list"]},
-    "/plugins":  {"label": "插件列表", "cli": ["hermes", "plugins", "list"], "timeout": 45},
-    "/skills":   {"label": "技能库",   "cli": ["hermes", "skills", "list"]},
-    "/bundles":  {"label": "技能包",   "cli": ["hermes", "bundles"]},
-    "/memory":   {"label": "记忆系统", "cli": ["hermes", "memory"]},
-    # 系统信息
-    "/version":  {"label": "框架版本", "cli": ["hermes", "--version"]},
-    "/profile":  {"label": "配置详情", "cli": ["hermes", "profile"]},
-    "/config":   {"label": "配置概览", "cli": ["hermes", "config", "show"]},
-    "/whoami":   {"label": "身份凭证", "cli": ["hermes", "auth", "list"]},
+    # Session Queries
+    "/status":   {"label": "Status (系统状态)", "cli": ["hermes", "status"]},
+    "/context":  {"label": "Context (上下文分析)", "cli": ["hermes", "prompt-size"]},
+    "/usage":    {"label": "Usage (配额用量)", "cli": ["hermes", "usage"]},
+    "/sessions": {"label": "Sessions (历史会话)", "cli": ["hermes", "sessions", "list", "--limit", "10"]},
+    # Tool & Diagnostics (with adaptive timeout tiers)
+    "/diff":     {"label": "Diff (代码差异)", "cli": ["git", "-C", str(INSTALL_PATH), "diff", "--stat"], "timeout": 45},
+    "/doctor":   {"label": "Doctor (健康诊断)", "cli": ["hermes", "doctor"], "timeout": 120},
+    "/debug":    {"label": "Debug (调试摘要)", "cli": ["hermes", "debug", "share", "--local"], "timeout": 45},
+    "/security": {"label": "Security (安全审计)", "cli": ["hermes", "security", "audit"], "timeout": 60},
+    "/logs":     {"label": "Logs (网关日志)", "cli": ["hermes", "logs", "gateway", "-n", "40"]},
+    "/cron":     {"label": "Cron (定时任务)", "cli": ["hermes", "cron", "list"]},
+    "/plugins":  {"label": "Plugins (插件列表)", "cli": ["hermes", "plugins", "list"], "timeout": 45},
+    "/skills":   {"label": "Skills (技能库)", "cli": ["hermes", "skills", "list"]},
+    "/bundles":  {"label": "Bundles (技能包)", "cli": ["hermes", "bundles"]},
+    "/memory":   {"label": "Memory (记忆系统)", "cli": ["hermes", "memory"]},
+    # System Info
+    "/version":  {"label": "Version (框架版本)", "cli": ["hermes", "--version"]},
+    "/profile":  {"label": "Profile (配置详情)", "cli": ["hermes", "profile"]},
+    "/config":   {"label": "Config (配置概览)", "cli": ["hermes", "config", "show"]},
+    "/whoami":   {"label": "Credentials (身份凭证)", "cli": ["hermes", "auth", "list"]},
 }
 
-_DEFAULT_CMD_TIMEOUT = 35
-
 CONFIG_CMDS: dict[str, dict] = {
-    "/model":         {"label": "模型切换", "kind": "picker"},
-    "/reasoning":     {"label": "推理力度", "options": ["none", "minimal", "low", "medium", "high"], "key": "agent.reasoning_effort"},
-    "/personality":   {"label": "AI人格",   "options": ["technical", "concise", "creative", "helpful", "hype", "noir", "philosopher", "teacher"], "key": "agent.personality"},
-    "/verbose":       {"label": "日志级别", "options": ["off", "tools", "all"], "key": "agent.verbose"},
-    "/yolo":          {"label": "极速模式", "options": ["true", "false"], "key": "agent.yolo"},
-    "/fast":          {"label": "高速模式", "options": ["true", "false"], "key": "agent.fast"},
-    "/codex-runtime": {"label": "运行时",   "options": ["app-server", "direct"], "key": "agent.codex_runtime"},
+    "/model":         {"label": "Switch Model (模型切换)", "kind": "picker"},
+    "/reasoning":     {"label": "Reasoning Effort (推理力度)", "options": ["none", "minimal", "low", "medium", "high"], "key": "agent.reasoning_effort"},
+    "/personality":   {"label": "Personality (AI 人格)", "options": ["technical", "concise", "creative", "helpful", "hype", "noir", "philosopher", "teacher"], "key": "agent.personality"},
+    "/verbose":       {"label": "Verbose Level (日志级别)", "options": ["off", "tools", "all"], "key": "agent.verbose"},
+    "/yolo":          {"label": "YOLO Mode (极速免审)", "options": ["true", "false"], "key": "agent.yolo"},
+    "/fast":          {"label": "Fast Mode (高速模式)", "options": ["true", "false"], "key": "agent.fast"},
+    "/codex-runtime": {"label": "Codex Runtime (执行环境)", "options": ["auto", "app", "cli"], "key": "agent.codex_runtime"},
 }
 
 SESSION_ACTS: dict[str, dict] = {
-    "/new":      {"label": "新建会话", "danger": True},
-    "/stop":     {"label": "强制停止", "danger": True},
-    "/undo":     {"label": "撤销回复", "danger": False},
-    "/retry":    {"label": "重试执行", "danger": False},
-    "/compress": {"label": "压缩会话", "danger": False},
+    "/new":      {"label": "New Session (新建会话)", "danger": True},
+    "/stop":     {"label": "Force Stop (强制停止)", "danger": True},
+    "/undo":     {"label": "Undo Turn (撤销回复)", "danger": False},
+    "/retry":    {"label": "Retry Turn (重试执行)", "danger": False},
+    "/compress": {"label": "Compress Context (压缩会话)", "danger": False},
 }
 
-# 引导类命令（弹出使用模板卡片）
 GUIDE_CMDS: dict[str, dict] = {
-    "/background": {"label": "后台任务", "template": "/background <提示词或任务目标>", "desc": "在独立后台进程中运行长耗时任务，不占用当前对话流。"},
-    "/steer":      {"label": "动态引导", "template": "/steer <干预指令>", "desc": "在 Agent 执行工具调用的间隙动态插入控制指令，修正执行方向。"},
-    "/goal":       {"label": "目标管理", "template": "/goal set <长期目标>", "desc": "设定跨多轮次生效的长期执行目标。"},
+    "/background": {"label": "Background Task (后台任务)", "template": "/background <prompt / 目标>", "desc": "Run a long-running task in a detached subagent without blocking the current chat."},
+    "/steer":      {"label": "Steer Command (动态干预)", "template": "/steer <instruction / 指令>", "desc": "Inject guidance mid-turn during agent execution to adjust course."},
+    "/goal":       {"label": "Goal Setting (目标管理)", "template": "/goal set <long-term goal>", "desc": "Set persistent goals across multiple conversation turns."},
 }
 
 CATEGORIES = [
-    ("session", "💬", "会话管理", "blue",
+    ("session", "💬", "Session (会话管理)", "blue",
      ["/new", "/stop", "/status", "/context", "/usage", "/sessions", "/undo", "/retry", "/compress", "/background"]),
-    ("config", "⚙️", "系统配置", "purple",
+    ("config", "⚙️", "Config (系统配置)", "purple",
      ["/model", "/reasoning", "/personality", "/verbose", "/yolo", "/fast", "/codex-runtime"]),
-    ("tools", "🔧", "工具研发", "green",
+    ("tools", "🔧", "Tools (工具研发)", "green",
      ["/diff", "/doctor", "/security", "/debug", "/logs", "/cron", "/plugins", "/skills", "/bundles", "/memory"]),
-    ("info", "ℹ️", "系统信息", "grey",
+    ("info", "ℹ️", "Info (系统信息)", "grey",
      ["/version", "/profile", "/config", "/whoami"]),
 ]
 
 _CMD_META: dict[str, dict] = {}
-for _d in (CLI_CMDS, CONFIG_CMDS, SESSION_ACTS, GUIDE_CMDS):
-    for _k, _v in _d.items():
-        _CMD_META[_k] = _v
+for c in [CLI_CMDS, CONFIG_CMDS, SESSION_ACTS, GUIDE_CMDS]:
+    _CMD_META.update(c)
 
-CMD_PARENT_CATEGORY: dict[str, str] = {
-    # 会话分类
-    "/new": "/card/session",
-    "/stop": "/card/session",
-    "/status": "/card/session",
-    "/context": "/card/session",
-    "/usage": "/card/session",
-    "/sessions": "/card/session",
-    "/undo": "/card/session",
-    "/retry": "/card/session",
-    "/compress": "/card/session",
-    "/background": "/card/session",
-    "/steer": "/card/session",
-    "/goal": "/card/session",
-    # 配置分类
-    "/model": "/card/config",
-    "/reasoning": "/card/config",
-    "/personality": "/card/config",
-    "/verbose": "/card/config",
-    "/yolo": "/card/config",
-    "/fast": "/card/config",
-    "/codex-runtime": "/card/config",
-    # 工具分类
-    "/diff": "/card/tools",
-    "/doctor": "/card/tools",
-    "/security": "/card/tools",
-    "/debug": "/card/tools",
-    "/logs": "/card/tools",
-    "/cron": "/card/tools",
-    "/plugins": "/card/tools",
-    "/skills": "/card/tools",
-    "/bundles": "/card/tools",
-    "/memory": "/card/tools",
-    # 信息分类
-    "/version": "/card/info",
-    "/profile": "/card/info",
-    "/config": "/card/info",
-    "/whoami": "/card/info",
-}
+CMD_PARENT_CATEGORY: dict[str, str] = {}
+for cat_key, _, _, _, cmds in CATEGORIES:
+    for c in cmds:
+        CMD_PARENT_CATEGORY[c] = f"/card/{cat_key}"
 
+QUICK_ACTIONS = [
+    ("🔄 **Switch Model** (模型切换)", "▶", "primary", {"action": "nav:/card/model"}),
+    ("📊 **System Status** (系统状态)", "▶", "default", {"action": "cmd:/status"}),
+    ("🆕 **New Session** (新建会话)", "▶", "default", {"action": "cmd:/new"}),
+    ("⏹ **Force Stop** (强制停止)", "▶", "danger", {"action": "cmd:/stop"}),
+]
 
 # ════════════════════════════════════════════════════════════════════════════
-# 4. 全量 Provider & Model 纯本地毫秒级发现
+# 4. State Management, RBAC & Native Config Set
 # ════════════════════════════════════════════════════════════════════════════
 
 _state_lock = threading.Lock()
@@ -579,20 +522,6 @@ _chat_card_map: dict[str, str] = {}
 _exec_tokens: dict[str, dict] = {}
 _cmd_cooldown: dict[str, float] = {}
 _cooldown_check_counter: int = 0
-
-
-def _cleanup_old_outputs() -> None:
-    """扫描 /tmp/hermes_*.txt，删除 mtime 超过 7 天的文件。"""
-    try:
-        cutoff = time.time() - 7 * 86400
-        for p in Path("/tmp").glob("hermes_*.txt"):
-            try:
-                if p.stat().st_mtime < cutoff:
-                    p.unlink(missing_ok=True)
-            except Exception:
-                pass
-    except Exception:
-        pass
 
 
 def _skey(chat_id: str, open_id: str) -> str:
@@ -615,63 +544,108 @@ def _mint_token(chat_id: str, open_id: str, mid: str, cmd: str, args: str) -> st
 def _redeem_token(tok: str, open_id: str) -> Optional[dict]:
     with _state_lock:
         rec = _exec_tokens.pop(tok, None)
-    if not rec or rec["exp"] < time.time():
-        return None
-    if rec["open_id"] != open_id:
-        return None
-    return rec
+        if not rec:
+            return None
+        if rec["exp"] < time.time():
+            return None
+        if rec["open_id"] and open_id and rec["open_id"] != open_id:
+            return None
+        return rec
 
 
-_STATIC_OAUTH_MODELS = {
+def _get_admin_open_ids(adapter: Any = None) -> set[str]:
+    admins = set()
+    env_admins = os.environ.get("FEISHU_ADMINS", "").strip()
+    if env_admins:
+        admins.update(a.strip() for a in env_admins.split(",") if a.strip())
+    if adapter is not None:
+        adapter_admins = getattr(adapter, "_admins", None)
+        if isinstance(adapter_admins, (list, set, tuple)):
+            admins.update(str(a).strip() for a in adapter_admins if a)
+    return admins
+
+
+def _is_admin(open_id: str, adapter: Any = None) -> bool:
+    """Strict fail-closed admin verification for write/dangerous actions."""
+    normalized = str(open_id or "").strip()
+    if not normalized:
+        return False
+    admins = _get_admin_open_ids(adapter)
+    if not admins:
+        return False
+    return "*" in admins or normalized in admins
+
+
+def _is_operator_allowed(open_id: str, adapter: Any = None) -> bool:
+    """Check if operator is allowed to trigger read-only cards."""
+    normalized = str(open_id or "").strip()
+    if not normalized:
+        return False
+    admins = _get_admin_open_ids(adapter)
+    allowed = set(admins)
+    env_allowed = os.environ.get("FEISHU_ALLOWED_USERS", "").strip()
+    if env_allowed:
+        allowed.update(a.strip() for a in env_allowed.split(",") if a.strip())
+    if adapter is not None:
+        group_allowed = getattr(adapter, "_allowed_group_users", None)
+        if isinstance(group_allowed, (list, set, tuple)):
+            allowed.update(str(u).strip() for u in group_allowed if u)
+    if not allowed:
+        return True
+    return "*" in allowed or normalized in allowed
+
+
+_STATIC_OAUTH_MODELS: dict[str, list[str]] = {
     "openai-codex": [
-        "gpt-6-astra", "gpt-6-astra-900k", "gpt-5.6-sol", "gpt-5.6-sol-900k",
-        "gpt-5.6-terra", "gpt-5.6-terra-900k", "gpt-5.6-luna", "gpt-5.6-luna-900k",
-        "gpt-5.5", "gpt-5.3-codex-spark",
+        "openai-codex/gpt-5.3-codex",
+        "openai-codex/gpt-5-codex",
+        "openai-codex/gpt-5-codex-mini",
+        "openai-codex/gpt-5.1-codex",
+        "openai-codex/gpt-5.1-codex-mini",
+        "openai-codex/gpt-5.2-codex",
     ],
     "xai-oauth": [
-        "grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning",
-        "grok-4.20-0309-non-reasoning", "grok-4.20-multi-agent-0309",
+        "xai/grok-4",
+        "xai/grok-4.5",
+        "xai/grok-4.5-mini",
+        "xai/grok-4.5-vision",
+        "xai/grok-code",
     ],
     "copilot": [
-        "claude-fable-5.1", "claude-fable-5", "claude-opus-4.7", "claude-sonnet-4-6", "gpt-5.6-sol",
+        "copilot/claude-sonnet-4.6",
+        "copilot/gpt-5.3-codex",
+        "copilot/gpt-4o",
     ],
-    "nous": [
-        "anthropic/claude-fable-5.1", "anthropic/claude-fable-5", "anthropic/claude-opus-5.5",
-    ],
-    "deepseek": [
-        "deepseek-flash", "deepseek-v4-pro",
-    ],
-    "gemini": [
-        "gemini-3.8-flash", "gemini-3-flash-preview", "gemini-2.5-flash-lite",
-    ],
-    "nvidia": [
-        "nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-super-120b-a12b", "meta/llama-3.3-70b-instruct",
+    "minimax-oauth": [
+        "minimax/MiniMax-Text-01",
     ],
 }
 
 
 def get_hermes_catalog_and_status():
-    cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    cfg = {}
     auth_data = {}
-    if AUTH_PATH.exists():
-        try:
-            auth_data = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+    try:
+        if CONFIG_PATH.exists():
+            cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        logger.warning("[command-palette] read config.yaml failed: %s", e)
+
+    try:
+        if AUTH_PATH.exists():
+            auth_data = json.loads(AUTH_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        logger.warning("[command-palette] read auth.json failed: %s", e)
 
     catalog: dict[str, list[str]] = {}
+    for cp in (cfg.get("custom_providers") or []):
+        name = cp.get("name")
+        models = cp.get("models") or []
+        if name and models:
+            catalog[name] = list(models)
 
-    for cp in cfg.get("custom_providers", []) or []:
-        pname = cp.get("name")
-        if not pname:
-            continue
-        models = list((cp.get("models") or {}).keys())
-        if not models and cp.get("model"):
-            models = [cp["model"]]
-        if models:
-            catalog[pname] = models
-
-    for pname, pinfo in (cfg.get("providers") or {}).items():
+    providers_block = cfg.get("providers") or {}
+    for pname, pinfo in providers_block.items():
         if pname == "custom":
             for sub, sinfo in (pinfo or {}).items():
                 if sub not in catalog and (sinfo or {}).get("model"):
@@ -691,7 +665,6 @@ def get_hermes_catalog_and_status():
     base_url = model_cfg.get("base_url", "")
     profile = os.environ.get("HERMES_PROFILE") or cfg.get("active_profile", "default")
 
-    # Current provider prioritized, others sorted
     norm_cur = cur_provider.replace("custom:", "")
     if norm_cur in catalog:
         ordered[norm_cur] = catalog[norm_cur]
@@ -702,36 +675,38 @@ def get_hermes_catalog_and_status():
     return ordered, cur_provider, cur_model, base_url, profile
 
 
-def _atomic_write_config(cfg: dict) -> None:
-    tmp = CONFIG_PATH.with_suffix(f".yaml.tmp-{os.getpid()}-{threading.get_ident()}")
-    tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
-    os.replace(tmp, CONFIG_PATH)
+def _switch_hermes_model(tgt_model: str, prov: str) -> tuple[bool, str]:
+    """Switch model via official `hermes config set` CLI without wiping comments."""
+    catalog, cur_p, cur_m, _, _ = get_hermes_catalog_and_status()
+    if prov not in catalog:
+        return False, f"Provider '{prov}' not in catalog"
+    if tgt_model not in catalog[prov]:
+        return False, f"Model '{tgt_model}' not found in provider '{prov}'"
 
-
-def _switch_hermes_model(tgt_model: str, prov: str) -> bool:
+    custom_names = set()
     try:
-        cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
-        cfg.setdefault("model", {})
-        cfg["model"]["default"] = tgt_model
+        if CONFIG_PATH.exists():
+            cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            for cp in (cfg.get("custom_providers") or []):
+                if cp.get("name"):
+                    custom_names.add(cp["name"])
+            for k in (cfg.get("providers") or {}).get("custom", {}).keys():
+                custom_names.add(k)
+    except Exception:
+        pass
 
-        custom_names = {cp.get("name") for cp in (cfg.get("custom_providers") or []) if cp.get("name")}
-        custom_dict_names = set((cfg.get("providers") or {}).get("custom", {}).keys())
-
-        if prov in custom_names or prov in custom_dict_names or prov == "custom":
-            cfg["model"]["provider"] = f"custom:{prov}" if prov != "custom" else "custom"
-        else:
-            cfg["model"]["provider"] = prov
-
-        _atomic_write_config(cfg)
-        logger.info("[command-palette] model successfully switched to: %s (%s)", tgt_model, cfg["model"]["provider"])
-        return True
-    except Exception as e:  # noqa: BLE001
-        logger.error("[command-palette] model switch failed: %s", e)
-        return False
+    prov_str = f"custom:{prov}" if (prov in custom_names or prov == "custom") else prov
+    r1 = run_subprocess(["hermes", "config", "set", "model.provider", prov_str, "--yes"], timeout=10)
+    if not r1.ok:
+        return False, f"Failed to set model.provider: {r1.stderr or r1.stdout}"
+    r2 = run_subprocess(["hermes", "config", "set", "model.default", tgt_model, "--yes"], timeout=10)
+    if not r2.ok:
+        return False, f"Failed to set model.default: {r2.stderr or r2.stdout}"
+    return True, ""
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 5. 卡片构建引擎（规范化多级双返回导航）
+# 5. Feishu Schema 1.0 Card Builders (Strict Standards)
 # ════════════════════════════════════════════════════════════════════════════
 
 def _pt(content: str) -> dict:
@@ -749,13 +724,15 @@ def _nav_btn(text: str, target: str, typ: str = "default") -> dict:
 def _card(title: str, template: str, elements: list) -> dict:
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"title": _pt(title), "template": template},
+        "header": {
+            "title": _pt(title),
+            "template": template,
+        },
         "elements": elements,
     }
 
 
 def _nav_row_for_subpage() -> dict:
-    """二级页紧凑导航：双列 column_set，返回 / 首页，按钮直接在 column 下。"""
     return {
         "tag": "column_set",
         "flex_mode": "bisect",
@@ -766,7 +743,7 @@ def _nav_row_for_subpage() -> dict:
                 "weight": 1,
                 "vertical_align": "center",
                 "horizontal_align": "left",
-                "elements": [_nav_btn("⬅ 返回", "/card/root", "default")],
+                "elements": [_nav_btn("⬅ Back (返回)", "/card/root", "default")],
             },
             {
                 "tag": "column",
@@ -774,15 +751,13 @@ def _nav_row_for_subpage() -> dict:
                 "weight": 1,
                 "vertical_align": "center",
                 "horizontal_align": "left",
-                "elements": [_nav_btn("🏠 首页", "/card/root", "default")],
+                "elements": [_nav_btn("🏠 Home (首页)", "/card/root", "default")],
             },
         ],
     }
 
 
 def _nav_row_for_deep_page(parent_target: str, extra_actions: list | None = None) -> dict:
-    """三级页紧凑导航：extra_actions 每行最多 2 个，最后一行放 返回/首页。
-    所有按钮直接在 column.elements 中，禁止嵌套 action 容器。"""
     def _make_column_set(btns: list[dict]) -> dict:
         columns = []
         for btn in btns:
@@ -802,73 +777,53 @@ def _nav_row_for_deep_page(parent_target: str, extra_actions: list | None = None
         rows.append(_make_column_set(extras[i:i + 2]))
 
     nav_btns = [
-        _nav_btn("⬅ 返回", parent_target, "default"),
-        _nav_btn("🏠 首页", "/card/root", "default"),
+        _nav_btn("⬅ Back (返回)", parent_target, "default"),
+        _nav_btn("🏠 Home (首页)", "/card/root", "default"),
     ]
     rows.append(_make_column_set(nav_btns))
 
     if len(rows) == 1:
         return rows[0]
-    return {"tag": "column_set", "flex_mode": "none", "columns": [
-        {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
-         "elements": rows},
-    ]}
-
-
-def _compact_button_grid(buttons: list[dict]) -> list[dict]:
-    """将按钮按每行 2 个构造成经典卡片 column_set 网格。"""
-    rows = []
-    for i in range(0, len(buttons), 2):
-        pair = buttons[i:i + 2]
-        columns = []
-        for btn in pair:
-            columns.append({
-                "tag": "column",
-                "width": "weighted",
-                "weight": 1,
-                "vertical_align": "center",
-                "elements": [btn],
-            })
-        rows.append({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "columns": columns,
-        })
-    return rows
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "columns": [
+            {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center", "elements": rows},
+        ],
+    }
 
 
 def _cc_category_grid(buttons: list[dict]) -> list[dict]:
-    """CC 风格分类按钮网格：bisect 模式，按钮带 width='fill'。"""
-    # 为每个按钮补上 width=fill
-    filled = []
-    for btn in buttons:
-        b = dict(btn)
-        b["width"] = "fill"
-        filled.append(b)
-    rows = []
-    for i in range(0, len(filled), 2):
-        pair = filled[i:i + 2]
-        columns = []
-        for btn in pair:
-            columns.append({
+    elements = []
+    for i in range(0, len(buttons), 2):
+        pair = buttons[i:i + 2]
+        cols = []
+        for b in pair:
+            cols.append({
                 "tag": "column",
                 "width": "weighted",
                 "weight": 1,
                 "vertical_align": "center",
                 "horizontal_align": "left",
-                "elements": [btn],
+                "elements": [b],
             })
-        rows.append({
+        if len(cols) == 1:
+            cols.append({
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "center",
+                "elements": [],
+            })
+        elements.append({
             "tag": "column_set",
             "flex_mode": "bisect",
-            "columns": columns,
+            "columns": cols,
         })
-    return rows
+    return elements
 
 
 def _cc_command_row(text: str, button_text: str, button_type: str, value: dict) -> dict:
-    """CC 风格命令行：左宽列放 markdown，右 auto 列放按钮，禁止 action 容器。"""
-    btn = {"tag": "button", "text": _pt(button_text), "type": button_type, "value": value}
     return {
         "tag": "column_set",
         "flex_mode": "none",
@@ -878,184 +833,70 @@ def _cc_command_row(text: str, button_text: str, button_type: str, value: dict) 
                 "width": "weighted",
                 "weight": 5,
                 "vertical_align": "center",
-                "elements": [{"tag": "markdown", "content": text}],
+                "horizontal_align": "left",
+                "elements": [{
+                    "tag": "markdown",
+                    "content": text,
+                }],
             },
             {
                 "tag": "column",
                 "width": "auto",
                 "vertical_align": "center",
-                "elements": [btn],
+                "horizontal_align": "right",
+                "elements": [{
+                    "tag": "button",
+                    "text": _pt(button_text),
+                    "type": button_type,
+                    "value": value,
+                }],
             },
         ],
     }
 
 
-# 配置选项中英双语标签映射 {cmd: {opt: "中文 English"}}
-CONFIG_OPTION_LABELS: dict[str, dict[str, str]] = {
-    "/reasoning": {
-        "none":    "关闭 none",
-        "minimal": "最小 minimal",
-        "low":     "低 low",
-        "medium":  "中等 medium",
-        "high":    "高 high",
-    },
-    "/personality": {
-        "technical":   "技术 technical",
-        "concise":     "简洁 concise",
-        "creative":    "创意 creative",
-        "helpful":     "助手 helpful",
-        "hype":        "热血 hype",
-        "noir":        "黑色 noir",
-        "philosopher": "哲思 philosopher",
-        "teacher":     "教师 teacher",
-    },
-    "/verbose": {
-        "off":   "关闭 off",
-        "tools": "工具 tools",
-        "all":   "全部 all",
-    },
-    "/yolo": {
-        "true":  "开启 true",
-        "false": "关闭 false",
-    },
-    "/fast": {
-        "true":  "开启 true",
-        "false": "关闭 false",
-    },
-    "/codex-runtime": {
-        "app-server": "应用服务 app-server",
-        "direct":     "直连 direct",
-    },
-}
-
-
-def _config_option_label(cmd: str, opt: str, is_cur: bool) -> str:
-    """返回配置选项的双语显示文本（单行），当前选中加 ● 前缀。格式：Emoji 中文 English"""
-    mapping = CONFIG_OPTION_LABELS.get(cmd, {})
-    if opt in mapping:
-        label = mapping[opt]
-    else:
-        zh = _CMD_META.get(cmd, {}).get("label", "选项")
-        label = f"{zh} {opt}"
-    emoji = CMD_EMOJI.get(cmd, "")
-    if emoji:
-        label = f"{emoji} {label}"
-    if is_cur:
-        label = "● " + label
-    return label
-
-
 def _cc_command_grid(cmds: list[str]) -> list[dict]:
-    """将命令列表构建为左列 markdown 文本 + 右列超短按钮的单行结构。"""
-    _DISPLAY_ALIAS: dict[str, str] = {
-        "/model":        "模型切换 model",
-        "/reasoning":    "推理力度 reasoning",
-        "/personality":  "人格选择 personality",
-        "/verbose":      "日志级别 verbose",
-        "/yolo":         "极速开关 yolo",
-        "/fast":         "高速开关 fast",
-        "/codex-runtime":"运行环境 codex",
-        "/status":       "系统状态 status",
-        "/context":      "上下文 context",
-        "/usage":        "配额用量 usage",
-        "/sessions":     "历史会话 sessions",
-        "/new":          "新建会话 new",
-        "/stop":         "强制停止 stop",
-        "/undo":         "撤销回复 undo",
-        "/retry":        "重试执行 retry",
-        "/compress":     "压缩会话 compress",
-        "/background":   "后台任务 background",
-        "/diff":         "代码差异 diff",
-        "/doctor":       "健康诊断 doctor",
-        "/debug":        "调试摘要 debug",
-        "/security":     "安全审计 security",
-        "/logs":         "网关日志 logs",
-        "/cron":         "定时任务 cron",
-        "/plugins":      "插件列表 plugins",
-        "/skills":       "技能库 skills",
-        "/bundles":      "技能包 bundles",
-        "/memory":       "记忆系统 memory",
-        "/version":      "框架版本 version",
-        "/profile":      "配置详情 profile",
-        "/config":       "配置概览 config",
-        "/whoami":       "身份凭证 whoami",
-        "/steer":        "动态引导 steer",
-        "/goal":         "目标管理 goal",
-    }
-    rows = []
+    elements = []
     for cmd in cmds:
         meta = _CMD_META.get(cmd, {})
-        danger = bool(meta.get("danger"))
-        btn_type = "danger" if danger else "default"
-        base_text = _DISPLAY_ALIAS.get(cmd) or f"{meta.get('label', cmd.strip('/'))} {cmd.strip('/')}"
-        emoji = CMD_EMOJI.get(cmd, "")
-        md_text = f"{emoji} **{base_text}**" if emoji else f"**{base_text}**"
-        btn_label = "执行"
-        rows.append({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 5,
-                    "vertical_align": "center",
-                    "elements": [{"tag": "markdown", "content": md_text}],
-                },
-                {
-                    "tag": "column",
-                    "width": "auto",
-                    "vertical_align": "center",
-                    "elements": [{
-                        "tag": "button",
-                        "text": _pt(btn_label),
-                        "type": btn_type,
-                        "value": {"action": f"cmd:{cmd}"},
-                    }],
-                },
-            ],
-        })
-    return rows
-
-
-QUICK_ACTIONS = [
-    ("🔄 **模型切换** model", "▶", "primary", {"action": "nav:/card/model"}),
-    ("📊 **系统状态** status", "▶", "default", {"action": "cmd:/status"}),
-    ("🆕 **新建会话** new", "▶", "default", {"action": "cmd:/new"}),
-    ("⏹ **强制停止** stop", "▶", "danger", {"action": "cmd:/stop"}),
-]
+        label = meta.get("label", cmd)
+        emoji = CMD_EMOJI.get(cmd, "▶")
+        btn_type = "danger" if meta.get("danger") else "default"
+        elements.append(_cc_command_row(f"{emoji} **{label}** `{cmd}`", "Run / 执行", btn_type, {"action": f"cmd:{cmd}"}))
+    return elements
 
 
 def _root_card() -> dict:
-    catalog, cur_p, cur_m, _, prof = get_hermes_catalog_and_status()
-    short_model = cur_m.split("/")[-1] if cur_m else cur_m
+    _, cur_p, cur_m, _, _ = get_hermes_catalog_and_status()
+    short_model = cur_m.split("/")[-1] if "/" in cur_m else cur_m
+    reasoning = "medium"
     try:
-        reasoning = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")).get("agent", {}).get("reasoning_effort", "medium") or "medium"
+        if CONFIG_PATH.exists():
+            c = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            reasoning = c.get("agent", {}).get("reasoning_effort", "medium")
     except Exception:
-        reasoning = "medium"
+        pass
+
+    cat_btns = []
+    for k, icon, title, _, _ in CATEGORIES:
+        cat_btns.append(_btn(f"{icon} {title}", "default", value={"action": f"nav:/card/{k}"}))
+
     elements = [
-        {"tag": "markdown",
-         "content": f"🟢 **{short_model}** · {reasoning}"},
-    ]
-    cat_btns = [
-        _nav_btn("💬 会话管理", "/card/session"),
-        _nav_btn("⚙️ 系统配置", "/card/config"),
-        _nav_btn("🔧 工具研发", "/card/tools"),
-        _nav_btn("ℹ️ 系统信息", "/card/info"),
+        {"tag": "markdown", "content": f"🟢 **{short_model}** · {reasoning}"},
     ]
     elements.extend(_cc_category_grid(cat_btns))
     elements.append({"tag": "hr"})
-    elements.append({"tag": "markdown", "content": "⚡ **快捷操作**"})
-    for text, btn_text, btn_type, value in QUICK_ACTIONS:
-        elements.append(_cc_command_row(text, btn_text, btn_type, value))
-    elements.append({"tag": "hr"})
-    return _card("⌨️ Hermes 控制面板", "blue", elements)
+    elements.append({"tag": "markdown", "content": "⚡ **Quick Actions (快捷操作)**"})
+    for label_md, btn_label, btn_typ, act_val in QUICK_ACTIONS:
+        elements.append(_cc_command_row(label_md, btn_label, btn_typ, act_val))
+    return _card("⌨️ Hermes Control Panel (控制面板)", "blue", elements)
 
 
 def _cat_card(ck: str, icon: str, title: str, color: str, cmds: list) -> dict:
     elements = _cc_command_grid(cmds)
+    elements.append({"tag": "hr"})
     elements.append(_nav_row_for_subpage())
-    return _card(f"{icon} {title} · {len(cmds)}项", color, elements)
+    return _card(f"{icon} {title}", color, elements)
 
 
 def _build_model_card(skey: str, provider: str = "", model: str = "",
@@ -1076,67 +917,64 @@ def _build_model_card(skey: str, provider: str = "", model: str = "",
         _pending_model[skey] = model
 
     prov_opts = [{"text": _pt(p), "value": p} for p in list(catalog.keys())[:100]]
-    model_opts = [{"text": _pt(m), "value": m} for m in models[:100]]
 
-    elements = []
-    if status_msg:
-        elements += [{"tag": "markdown", "content": status_msg}]
-    else:
-        elements += [
-            {"tag": "markdown",
-             "content": f"🟢 当前: `{cur_m}` (`{cur_p}`)  |  📦 `{len(catalog)}` 通道"},
-        ]
-
-    elements += [
-        {"tag": "markdown", "content": f"🏢 通道 `{provider}`"},
-        {"tag": "action", "actions": [{
+    action_elements = [
+        {
             "tag": "select_static",
-            "placeholder": _pt("点击展开选择 Provider"),
+            "placeholder": _pt(f"Provider: {provider}"),
             "value": {"action": "select_provider"},
-            "initial_option": provider,
             "options": prov_opts,
-        }]},
-        {"tag": "markdown", "content": f"🤖 模型 · `{len(models)}` 个"},
+            "initial_option": provider if provider in catalog else None,
+        }
     ]
 
     if len(models) > 50:
-        first_half = model_opts[:50]
-        second_half = model_opts[50:]
-        elements += [
-            {"tag": "action", "actions": [{
-                "tag": "select_static",
-                "placeholder": _pt("模型 A-M（前50个）"),
-                "value": {"action": "select_model", "provider": provider},
-                "initial_option": model if model in [o["value"] for o in first_half] else None,
-                "options": first_half,
-            }]},
-            {"tag": "action", "actions": [{
-                "tag": "select_static",
-                "placeholder": _pt("模型 N-Z（后续）"),
-                "value": {"action": "select_model", "provider": provider},
-                "initial_option": model if model in [o["value"] for o in second_half] else None,
-                "options": second_half,
-            }]},
-        ]
+        opts_part1 = [{"text": _pt(m), "value": m} for m in models[:50]]
+        opts_part2 = [{"text": _pt(m), "value": m} for m in models[50:100]]
+        action_elements.append({
+            "tag": "select_static",
+            "placeholder": _pt(f"Models 1-50 (current: {model.split('/')[-1]})"),
+            "value": {"action": "select_model", "provider": provider},
+            "options": opts_part1,
+            "initial_option": model if model in [o["value"] for o in opts_part1] else None,
+        })
+        action_elements.append({
+            "tag": "select_static",
+            "placeholder": _pt(f"Models 51+ ({len(models)} total)"),
+            "value": {"action": "select_model", "provider": provider},
+            "options": opts_part2,
+            "initial_option": model if model in [o["value"] for o in opts_part2] else None,
+        })
     else:
-        elements += [
-            {"tag": "action", "actions": [{
-                "tag": "select_static",
-                "placeholder": _pt("点击展开选择模型"),
-                "value": {"action": "select_model", "provider": provider},
-                "initial_option": model,
-                "options": model_opts,
-            }]},
-        ]
+        model_opts = [{"text": _pt(m), "value": m} for m in models[:100]]
+        action_elements.append({
+            "tag": "select_static",
+            "placeholder": _pt(f"Model: {model.split('/')[-1]}"),
+            "value": {"action": "select_model", "provider": provider},
+            "options": model_opts,
+            "initial_option": model if model in models else None,
+        })
 
-    elements += [
-        {"tag": "markdown", "content": f"📌 待生效: `{provider}` / `{model}`"},
-        _nav_row_for_deep_page(
-            parent_target="/card/config",
-            extra_actions=[_btn("✅ 确认切换", "primary", value={"action": f"confirm_switch:{provider}:{model}"})],
-        ),
+    elements = [
+        {"tag": "markdown", "content": f"🎯 **Active (生效中)**: `{cur_m}`\n🔌 **Provider (部署源)**: `{cur_p}`"},
+        {"tag": "hr"},
+        {"tag": "markdown", "content": "👇 **Select Provider & Model (选择通道与模型)**"},
+        {"tag": "action", "actions": action_elements},
+        {"tag": "hr"},
+        {
+            "tag": "action",
+            "actions": [
+                _btn("✅ Confirm Switch (确认切换)", "primary", value={"action": f"confirm_switch:{provider}:{model}"}),
+            ],
+        },
     ]
-    return _card("🔄 模型与提供商切换", ("green" if ok else "red") if status_msg else "purple", elements)
+
+    if status_msg:
+        elements.insert(0, {"tag": "markdown", "content": status_msg})
+
+    elements.append({"tag": "hr"})
+    elements.append(_nav_row_for_deep_page("/card/config"))
+    return _card("🔄 Model Switch (模型切换)", ("green" if ok else "red") if status_msg else "purple", elements)
 
 
 def _build_options_card(cmd: str) -> dict:
@@ -1144,56 +982,47 @@ def _build_options_card(cmd: str) -> dict:
     opts = meta.get("options") or []
     cfg_key = meta.get("key", f"agent.{cmd.lstrip('/')}")
 
-    cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
-    node = cfg
-    for k in cfg_key.split("."):
-        node = node.get(k, {}) if isinstance(node, dict) else {}
-    cur = str(node) if node != {} else "未设置"
+    cur = "unknown"
+    try:
+        if CONFIG_PATH.exists():
+            cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            val = cfg
+            for part in cfg_key.split("."):
+                val = val.get(part, {}) if isinstance(val, dict) else {}
+            cur = str(val) if val != {} else "default"
+    except Exception:
+        pass
 
-    elements = [{"tag": "markdown", "content": f"当前值: `{cur}`"}]
+    elements = [
+        {"tag": "markdown", "content": f"Current value (当前值): `{cur}`"},
+    ]
     for opt in opts:
-        is_cur = (str(opt).lower() == str(cur).lower())
-        md_text = _config_option_label(cmd, str(opt), is_cur)
+        is_cur = (str(opt).lower() == cur.lower())
         btn_type = "primary" if is_cur else "default"
-        elements.append({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 5,
-                    "vertical_align": "center",
-                    "elements": [{"tag": "markdown", "content": md_text}],
-                },
-                {
-                    "tag": "column",
-                    "width": "auto",
-                    "vertical_align": "center",
-                    "elements": [{
-                        "tag": "button",
-                        "text": _pt("选择"),
-                        "type": btn_type,
-                        "value": {"action": f"set_cfg:{cmd}:{opt}"},
-                    }],
-                },
-            ],
-        })
+        btn_text = "✓ Active (当前)" if is_cur else "Select (选择)"
+        display_text = f"● **{opt}**" if is_cur else f"**{opt}**"
+        elements.append(_cc_command_row(
+            display_text, btn_text, btn_type,
+            {"action": f"set_cfg:{cmd}:{opt}"}
+        ))
+
+    elements.append({"tag": "hr"})
     elements.append(_nav_row_for_deep_page(CMD_PARENT_CATEGORY.get(cmd, "/card/config")))
-    return _card(f"⚙️ 设置 {meta.get('label', cmd)}", "purple", elements)
+    return _card(f"⚙️ Settings: {meta.get('label', cmd)}", "purple", elements)
 
 
 def _build_guide_card(cmd: str) -> dict:
-    """参数指令使用指南与模板卡片"""
     meta = GUIDE_CMDS.get(cmd, {})
     template = meta.get("template", cmd)
     desc = meta.get("desc", "")
     elements = [
-        {"tag": "markdown",
-         "content": f"💡 **{meta.get('label', cmd)}**：{desc}\n**格式**：`{template}`\n复制替换参数后直接发送。"},
+        {"tag": "markdown", "content": f"📖 **Description (说明)**\n{desc}"},
+        {"tag": "markdown", "content": f"📋 **Template (使用格式)**\n```{template}```"},
+        {"tag": "markdown", "content": "💡 *Copy the template above and send to chat to execute.*"},
+        {"tag": "hr"},
         _nav_row_for_deep_page(CMD_PARENT_CATEGORY.get(cmd, "/card/session")),
     ]
-    return _card(f"💡 {meta.get('label', cmd)} 指南", "blue", elements)
+    return _card(f"💡 Guide: {meta.get('label', cmd)}", "blue", elements)
 
 
 def _build_exec_confirm_card(cmd: str, args: str, token: str) -> dict:
@@ -1201,37 +1030,36 @@ def _build_exec_confirm_card(cmd: str, args: str, token: str) -> dict:
     full = f"{cmd} {args}".strip()
     elements = [
         {"tag": "markdown", "content": (
-            f"⚠️ **高危确认** `{full}`\n"
-            f"{meta.get('label', '')} — 将重置会话或中止进程。令牌 120 秒有效、仅本人点击有效。")},
+            f"⚠️ **High Risk Confirmation (高危确认)**: `{full}`\n"
+            f"{meta.get('label', '')} — Token valid for 120s. Only clicking user authorized.")},
     ]
     confirm_btns = [
-        _btn("✅ 确认执行", "danger", value={"action": f"exec_confirm:{token}"}),
-        _btn("❌ 取消", "default", value={"action": "exec_cancel"}),
-        _nav_btn("⬅ 返回上级", CMD_PARENT_CATEGORY.get(cmd, "/card/session")),
-        _nav_btn("🏠 返回首页", "/card/root"),
+        _btn("✅ Confirm (确认执行)", "danger", value={"action": f"exec_confirm:{token}"}),
+        _btn("❌ Cancel (取消)", "default", value={"action": "exec_cancel"}),
+        _nav_btn("⬅ Back (返回)", CMD_PARENT_CATEGORY.get(cmd, "/card/session")),
+        _nav_btn("🏠 Home (首页)", "/card/root"),
     ]
     elements.extend(_cc_category_grid(confirm_btns))
-    return _card(f"⚠️ 确认 {meta.get('label', cmd)}", "red", elements)
+    return _card(f"⚠️ Confirm: {meta.get('label', cmd)}", "red", elements)
 
 
-def _build_streaming_card(cmd: str, elapsed: float, recent_lines: list[str],
-                           is_heartbeat: bool = False) -> dict:
+def _build_streaming_card(cmd: str, elapsed: float, recent_lines: list[str], is_heartbeat: bool = False) -> dict:
     meta = _CMD_META.get(cmd, {})
     label = meta.get("label", cmd)
-    header_content = f"⚡ **正在执行 {label} ({cmd})**  |  ⏱️ {elapsed:.1f}s"
+    header_content = f"⚡ Running: {label} ({cmd})  |  ⏱️ {elapsed:.1f}s"
     if recent_lines:
         log_block = "```text\n" + "\n".join(recent_lines) + "\n```"
-        subtitle = f"⏳ **终端输出实时捕获中** · 已耗时 `{elapsed:.1f}s`"
+        subtitle = f"⏳ **Live Output Capture (终端捕获中)** · Elapsed `{elapsed:.1f}s`"
     elif is_heartbeat:
-        log_block = "⏳ *后台深度检测中，暂无终端输出...*"
-        subtitle = f"⏳ **后台深度检测中** · 已耗时 `{elapsed:.1f}s`（进程活跃运行中）"
+        log_block = "⏳ *Deep diagnostics in progress, waiting for next output...*"
+        subtitle = f"⏳ **Deep Diagnostics (后台检测中)** · Elapsed `{elapsed:.1f}s` (Process Active)"
     else:
-        log_block = "⏳ *等待终端首包输出...*"
-        subtitle = f"⏳ **终端输出实时捕获中** · 已耗时 `{elapsed:.1f}s`"
+        log_block = "⏳ *Waiting for initial process output...*"
+        subtitle = f"⏳ **Process Initializing (正在初始化)** · Elapsed `{elapsed:.1f}s`"
     elements = [
         {"tag": "markdown", "content": subtitle},
         {"tag": "markdown", "content": log_block},
-        {"tag": "markdown", "content": "ℹ️ *流式动态卡片实验中（动态刷新），执行完毕将自动折叠为完整报告*"},
+        {"tag": "markdown", "content": "ℹ️ *Live streaming preview. Final report folds automatically on completion.*"},
         _nav_row_for_deep_page(CMD_PARENT_CATEGORY.get(cmd, "/card/root")),
     ]
     return {
@@ -1245,149 +1073,141 @@ def _build_running_card(cmd: str) -> dict:
     meta = _CMD_META.get(cmd, {})
     elements = [
         {"tag": "markdown",
-         "content": f"⏳ **正在执行** `{cmd}`（{meta.get('label', '')}）…完成后自动重绘结果卡。"},
+         "content": f"⏳ **Executing** `{cmd}` ({meta.get('label', '')})... Card updates automatically on completion."},
         _nav_row_for_deep_page(CMD_PARENT_CATEGORY.get(cmd, "/card/root")),
     ]
     return _card(f"⚡ {meta.get('label', cmd)}", "yellow", elements)
 
 
 def _build_copy_card(cmd: str, saved_path: str) -> dict:
-    """构建便于移动端/桌面端完整选中文本的复制卡片。"""
     if not cmd and saved_path:
         cmd = _infer_cmd_from_saved_path(saved_path)
-
     meta = _CMD_META.get(cmd, {})
-    label = meta.get("label", cmd or "命令输出")
+    label = meta.get("label", cmd or "Output")
 
     content, err = _read_saved_output(saved_path)
     if err:
-        body = f"无法读取归档内容: {err}"
+        body = f"Failed to read archive: {err}"
     else:
         truncated = False
         display = content
-        # 先按字符数截断到 18000，再按 JSON 字节数动态收缩
         if len(display) > 18000:
             display = display[:18000]
             truncated = True
         safe_display = display.replace("```", r"\`\`\`")
-        suffix = f"\n[卡片展示已截断，完整内容见归档文件: {saved_path}]" if truncated else ""
+        suffix = f"\n[Truncated in card preview. Full archive: {saved_path}]" if truncated else ""
         body = f"```text\n{safe_display}\n```{suffix}"
-        # 验证 card JSON 字节数，必要时继续缩短
         _test_card = {"tag": "markdown", "content": body}
         while len(json.dumps(_test_card, ensure_ascii=False).encode("utf-8")) > 26000 and len(safe_display) > 200:
             safe_display = safe_display[:int(len(safe_display) * 0.85)]
             truncated = True
-            body = f"```text\n{safe_display}\n```\n[卡片展示已截断，完整内容见归档文件: {saved_path}]"
+            body = f"```text\n{safe_display}\n```\n[Card size limit reached. Full archive: {saved_path}]"
             _test_card = {"tag": "markdown", "content": body}
 
-    parent_cat = CMD_PARENT_CATEGORY.get(cmd, "/card/root")
     elements = [
-        {"tag": "markdown", "content": "请在飞书中长按（手机）或选中（电脑）以下内容复制"},
+        {"tag": "markdown", "content": f"📋 **Full Raw Output (完整内容)** · `{cmd}`"},
         {"tag": "markdown", "content": body},
-        {
-            "tag": "action",
-            "actions": [
-                _btn("⬅ 返回结果", "primary", value={"action": f"show_result:{saved_path}"}),
-                _nav_btn("⬅ 返回上级", parent_cat, "default"),
-                _nav_btn("🏠 返回首页", "/card/root", "default"),
+        {"tag": "hr"},
+        {"tag": "markdown", "content": f"📄 **Archive File (归档文件)**\n`{saved_path}`"},
+        _nav_row_for_deep_page(
+            CMD_PARENT_CATEGORY.get(cmd, "/card/root"),
+            extra_actions=[
+                _btn("↩ Back to Report (返回报告)", "default", value={"action": f"show_result:{saved_path}"}),
+                _btn("🔁 Re-run (再次执行)", "primary", value={"action": f"cmd:{cmd}"}),
             ],
-        },
+        ),
     ]
-    return _card(f"📋 复制 {label}", "blue", elements)
+    return _card(f"📋 Copy: {label}", "grey", elements)
 
 
 def _result_status_from_text(text: str) -> bool:
-    """从归档文本判断是否包含失败/异常标识，返回 ok 布尔值。"""
-    if not text:
-        return True
-    patterns = [r"^[ \t]*✗", r"\bTraceback\b", r"\bError\b", r"\bException\b", r"exit code [1-9]"]
-    for pat in patterns:
-        if re.search(pat, text, re.MULTILINE):
-            return False
+    clean = _strip_ansi(text or "")
+    if re.search(r"^[ \t]*✗", clean, re.M):
+        return False
     return True
 
 
-def _build_beautiful_result_card(cmd: str, raw_output: str, elapsed: float = 0.0, ok: bool = True,
-                                  saved_path: str = "", status_text: str = "",
-                                  timed_out: bool = False) -> dict:
+def _build_beautiful_result_card(cmd: str, raw_output: str, elapsed: float = 0.0,
+                                 ok: bool = True, saved_path: str = "",
+                                 timed_out: bool = False,
+                                 status_text: str = "") -> dict:
     meta = _CMD_META.get(cmd, {})
     label = meta.get("label", cmd)
 
     if timed_out:
-        raw_output = f"⚠️ 命令执行超时（已捕获部分输出）\n\n{raw_output}"
+        raw_output = f"⚠️ Command execution timed out (Partial output captured / 已捕获部分输出)\n\n{raw_output}"
 
     sub_elements, _saved = parse_and_beautify_output(cmd, raw_output)
     if not saved_path:
         saved_path = _saved
 
-    no_data = (
-        "no account usage available" in raw_output.lower()
-        or "no credential is configured" in raw_output.lower()
-    )
+    is_no_data = False
+    lower_out = (raw_output or "").lower()
+    if "no account usage available" in lower_out or "no credential is configured" in lower_out:
+        is_no_data = True
 
-    if timed_out:
-        header_template = "orange"
-        time_part = f"  |  ⏱️ 耗时 `{elapsed:.1f}s`" if elapsed > 0 else ""
-        header_content = f"⚠️ **{label} ({cmd}) 执行超时**{time_part}"
-    elif no_data:
-        header_template = "grey"
-        time_part = f"  |  ⏱️ 耗时 `{elapsed:.1f}s`" if elapsed > 0 else ""
-        header_content = f"ℹ️ **{label} ({cmd}) 暂无数据**{time_part}"
+    if is_no_data:
+        template = "grey"
+        title_text = f"ℹ️ **{label} ({cmd}) No Data (暂无数据)**  |  ⏱️ {elapsed:.1f}s"
+    elif timed_out:
+        template = "orange"
+        title_text = f"⚠️ **{label} ({cmd}) Timed Out (执行超时)**  |  ⏱️ {elapsed:.1f}s"
+    elif ok:
+        template = "green"
+        status_disp = status_text or "Success (执行成功)"
+        title_text = f"✅ **{label} ({cmd}) {status_disp}**  |  ⏱️ {elapsed:.1f}s"
     else:
-        header_template = "green" if ok else "red"
-        icon = "✅" if ok else "❌"
-        if elapsed > 0:
-            time_part = f"  |  ⏱️ 耗时 `{elapsed:.1f}s`"
-        elif status_text:
-            time_part = f"  |  {status_text}"
-        else:
-            time_part = "  |  已归档结果"
-        header_content = f"{icon} **{label} ({cmd}) 执行{'成功' if ok else '遇到异常'}**{time_part}"
+        template = "red"
+        status_disp = status_text or "Failed (执行失败)"
+        title_text = f"❌ **{label} ({cmd}) {status_disp}**  |  ⏱️ {elapsed:.1f}s"
 
-    elements = [{"tag": "markdown", "content": header_content}]
-    elements.extend(sub_elements)
+    elements = list(sub_elements)
+    elements.append({"tag": "hr"})
 
     parent_cat = CMD_PARENT_CATEGORY.get(cmd, "/card/root")
-    extra_actions = [
-        _btn("📋 复制内容", "primary", value={"action": f"copy_output:{saved_path}"}),
-        _btn("🔁 再次执行", "default", value={"action": f"cmd:{cmd}"}),
-    ]
-    elements.append(_nav_row_for_deep_page(
-        parent_target=parent_cat,
-        extra_actions=extra_actions,
-    ))
-    card_icon = "⚠️" if timed_out else ("ℹ️" if no_data else ("✅" if ok else "❌"))
-    return _card(f"{card_icon} {label}", header_template, elements)
+    extra_actions = []
+    if saved_path:
+        extra_actions.append(_btn("📋 Copy (复制内容)", "default", value={"action": f"copy_output:{saved_path}"}))
+    extra_actions.append(_btn("🔁 Re-run (再次执行)", "primary", value={"action": f"cmd:{cmd}"}))
+
+    elements.append(_nav_row_for_deep_page(parent_cat, extra_actions=extra_actions))
+    return _card(title_text, template, elements)
 
 
 def _nav(action: str, skey: str = "") -> dict:
-    b = action[4:] if action.startswith("nav:") else action
-    if b in ("", "/card", "/card/root"):
+    sub = action[4:].strip()
+    if sub in ("/card/root", "root", "/card"):
         return _root_card()
-    if b == "/card/model":
+    if sub in ("/card/model", "model"):
         return _build_model_card(skey)
-    for ck, ic, tn, cc, cmds in CATEGORIES:
-        if b == f"/card/{ck}":
-            return _cat_card(ck, ic, tn, cc, cmds)
+    for k, icon, title, color, cmds in CATEGORIES:
+        if sub in (f"/card/{k}", k):
+            return _cat_card(k, icon, title, color, cmds)
     return _root_card()
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 6. 执行与卡片重绘通道
+# 6. Messaging Egress via lark-cli & Asynchronous Dispatch
 # ════════════════════════════════════════════════════════════════════════════
 
 def _patch_card(mid: str, card: dict) -> bool:
     if not mid:
         return False
+    if not _check_lark_cli():
+        logger.error("[command-palette] lark-cli not found in PATH")
+        return False
     data = json.dumps({"content": json.dumps(card, ensure_ascii=False)}, ensure_ascii=False)
-    res = run_lark(["im", "messages", "patch", "--as", "bot", "--message-id", mid, "--data", data], timeout=15)
+    res = run_lark(["im", "messages", "patch", "--as", "bot", "--message-id", mid,
+                    "--data", data], timeout=25)
     if not res.ok:
-        logger.error("[command-palette] _patch_card failed: exit=%s stderr=%s stdout=%s",
-                     res.exit_code, (res.stderr or "").strip()[:500], (res.stdout or "").strip()[:200])
+        logger.error("[command-palette] patch failed: mid=%s exit=%s stderr=%s", mid, res.exit_code, res.stderr)
     return res.ok
 
 
 def _send_root_card(chat_id: str, card: dict) -> bool:
+    if not _check_lark_cli():
+        logger.error("[command-palette] lark-cli not found in PATH")
+        return False
     res = run_lark(["im", "+messages-send", "--as", "bot", "--chat-id", chat_id,
                     "--msg-type", "interactive", "--content", json.dumps(card, ensure_ascii=False)], timeout=25)
     if res.ok:
@@ -1397,10 +1217,10 @@ def _send_root_card(chat_id: str, card: dict) -> bool:
                 _chat_card_map[chat_id] = mid
                 if len(_chat_card_map) > 500:
                     del _chat_card_map[next(iter(_chat_card_map))]
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     else:
-        logger.error("[command-palette] /card send failed: exit=%s stderr=%s stdout=%s",
+        logger.error("[command-palette] send failed: exit=%s stderr=%s stdout=%s",
                      res.exit_code, (res.stderr or "").strip(), (res.stdout or "").strip())
     return res.ok
 
@@ -1419,14 +1239,6 @@ def _execute_cli_async(cmd: str, mid: str) -> None:
         res = run_subprocess(argv, timeout=cmd_timeout)
         elapsed = time.monotonic() - t0
         output_text = res.stdout if res.ok else (res.stderr or res.stdout or f"exit code {res.exit_code}")
-        if res.timed_out and output_text:
-            safe_cmd = cmd.strip("/").replace(" ", "_") or "output"
-            ts_str = time.strftime("%Y%m%d_%H%M%S")
-            partial_path = Path(f"/tmp/hermes_{safe_cmd}_timeout_{ts_str}.txt")
-            try:
-                partial_path.write_text(_strip_ansi(output_text), encoding="utf-8")
-            except Exception:
-                pass
         card = _build_beautiful_result_card(cmd, output_text, elapsed=elapsed, ok=res.ok, timed_out=res.timed_out)
         if mid:
             _patch_card(mid, card)
@@ -1467,7 +1279,7 @@ def _execute_cli_async(cmd: str, mid: str) -> None:
     if res.timed_out and output_text:
         safe_cmd = cmd.strip("/").replace(" ", "_") or "output"
         ts_str = time.strftime("%Y%m%d_%H%M%S")
-        partial_path = Path(f"/tmp/hermes_{safe_cmd}_timeout_{ts_str}.txt")
+        partial_path = PLUGIN_DATA_DIR / f"hermes_{safe_cmd}_timeout_{ts_str}.txt"
         try:
             partial_path.write_text(_strip_ansi(output_text), encoding="utf-8")
         except Exception:
@@ -1479,112 +1291,89 @@ def _execute_cli_async(cmd: str, mid: str) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 7. 同步回调入口（handle_card_action_sync）
+# 7. Unified Action Dispatcher (Shared by Synthetic Messages & Callbacks)
 # ════════════════════════════════════════════════════════════════════════════
 
-def _resp(card: dict = None, toast: str = "", toast_type: str = "info"):
-    from lark_oapi.event.callback.model.p2_card_action_trigger import (
-        CallBackCard, CallBackToast, P2CardActionTriggerResponse)
-    r = P2CardActionTriggerResponse()
-    if card is not None:
-        c = CallBackCard()
-        c.type = "raw"
-        c.data = card
-        r.card = c
-    if toast:
-        t = CallBackToast()
-        t.type = toast_type
-        t.content = toast
-        r.toast = t
-    return r
-
-
-def handle_card_action_sync(adapter: Any, data: Any) -> Optional[Any]:
-    try:
-        from lark_oapi.event.callback.model.p2_card_action_trigger import (  # noqa: F401
-            P2CardActionTriggerResponse)
-    except Exception as e:  # noqa: BLE001
-        logger.error("[command-palette] lark_oapi callback models unavailable: %s", e)
-        return None
-
-    event = getattr(data, "event", None)
-    act = getattr(event, "action", None) if not isinstance(event, dict) else (event or {}).get("action")
-    av = (getattr(act, "value", {}) or {}) if act else {}
-    ac = av.get("action", "") if isinstance(av, dict) else ""
-    opt = getattr(act, "option", "") or ""
-
-    ctx = getattr(event, "context", None) if not isinstance(event, dict) else (event or {}).get("context")
-    cid = getattr(ctx, "open_chat_id", "") if ctx else ""
-    mid = getattr(ctx, "open_message_id", "") if ctx else ""
-    operator = getattr(event, "operator", None) if not isinstance(event, dict) else (event or {}).get("operator")
-    open_id = getattr(operator, "open_id", "") if operator else ""
-
-    if mid and cid:
-        _chat_card_map[cid] = mid
-        if len(_chat_card_map) > 500:
-            del _chat_card_map[next(iter(_chat_card_map))]
+def dispatch_palette_action(action_value: dict, cid: str, mid: str, open_id: str,
+                            adapter: Any = None) -> tuple[Optional[dict], str, str]:
+    """Execute panel action. Returns (card, toast_text, toast_type)."""
+    ac = action_value.get("action", "")
+    opt = action_value.get("option", "")
     sk = _skey(cid, open_id)
 
-    checker = getattr(adapter, "_is_interactive_operator_authorized", None)
-    if callable(checker) and not checker(open_id):
-        return _resp(toast="⛔ 您无权操作此控制面板", toast_type="error")
-
-    logger.info("[command-palette] ac=%s opt=%s cid=%s uid=%s", ac, opt, cid, open_id)
-
-    # ── 1. 下拉选择（暂存状态） ──
+    # 1. Dropdown Selection Staging
     if ac == "select_provider" and opt:
         with _state_lock:
             _selected_provider[sk] = opt
             _pending_model.pop(sk, None)
         card = _build_model_card(sk, provider=opt)
-        return _resp(card, f"已选择通道: {opt}")
+        return card, f"Provider selected: {opt}", "info"
 
     if ac == "select_model" and opt:
-        prov = av.get("provider", _selected_provider.get(sk, ""))
+        prov = action_value.get("provider", _selected_provider.get(sk, ""))
         with _state_lock:
             _pending_model[sk] = opt
+            if prov:
+                _selected_provider[sk] = prov
         card = _build_model_card(sk, provider=prov, model=opt)
-        return _resp(card, f"已选择模型: {opt}")
+        return card, f"Model selected: {opt.split('/')[-1]}", "info"
 
-    # ── 2. 模型切换【纯同步 2ms 搞定，立即返回绿色成功卡，绝不杀网关】 ──
+    # 2. Confirm Model Switch (Write Action: Admin Gated)
     if ac.startswith("confirm_switch:"):
+        if not _is_admin(open_id, adapter):
+            return None, "⛔ Permission denied: Admin privileges required / 需要管理员权限", "error"
+
         parts = ac.split(":", 2)
         prov = parts[1] if len(parts) > 1 else ""
         tgt = parts[2] if len(parts) > 2 else _pending_model.get(sk, "")
         if not tgt:
-            return _resp(toast="请先在下拉列表中选择目标模型", toast_type="warning")
+            return None, "Please select a target model first / 请先选择目标模型", "warning"
 
-        ok = _switch_hermes_model(tgt, prov)
+        ok, err = _switch_hermes_model(tgt, prov)
         if ok:
-            msg = f"🎉 **模型切换成功！**\n• 当前生效模型: `{tgt}`\n• 当前部署通道: `{prov}`\n*(配置已毫秒级更新，后续交互即刻生效)*"
+            msg = f"🎉 **Model Switched Successfully (模型切换成功)**\n• Model: `{tgt}`\n• Provider: `{prov}`"
+            toast = f"Switched to {tgt.split('/')[-1]}"
         else:
-            msg = f"❌ **模型切换写入失败**\n目标: `{tgt}` ({prov})"
+            msg = f"❌ **Model Switch Failed (模型切换失败)**\n{err}"
+            toast = "Switch failed / 切换失败"
 
         card = _build_model_card(sk, provider=prov, model=tgt, status_msg=msg, ok=ok)
-        return _resp(card, toast="模型切换完成！" if ok else "切换失败")
+        return card, toast, "info" if ok else "error"
 
-    # ── 3. 参数配置点选（/reasoning /personality /verbose /yolo /fast 单选卡直接生效） ──
+    # 3. Direct Config Setting (Write Action: Admin Gated + Whitelisted)
     if ac.startswith("set_cfg:"):
+        if not _is_admin(open_id, adapter):
+            return None, "⛔ Permission denied: Admin privileges required / 需要管理员权限", "error"
+
         parts = ac.split(":", 2)
         cmd = parts[1] if len(parts) > 1 else ""
         val = parts[2] if len(parts) > 2 else ""
         meta = CONFIG_CMDS.get(cmd, {})
-        cfg_key = meta.get("key", f"agent.{cmd.lstrip('/')}")
-        run_subprocess(["hermes", "config", "set", cfg_key, val, "--yes"], timeout=10)
-        card = _build_options_card(cmd)
-        return _resp(card, toast=f"已将 {cmd} 设为 {val}")
+        allowed_opts = meta.get("options") or []
+        if val not in allowed_opts:
+            return None, f"⛔ Invalid option: {val} not in {allowed_opts}", "error"
 
-    # ── 4. 危险操作二次确认与兑换 (/new, /stop) ──
+        cfg_key = meta.get("key", f"agent.{cmd.lstrip('/')}")
+        res = run_subprocess(["hermes", "config", "set", cfg_key, val, "--yes"], timeout=10)
+        card = _build_options_card(cmd)
+        if res.ok:
+            return card, f"Set {cmd} to {val} (已生效)", "info"
+        return card, f"Failed to set config: {res.stderr or res.stdout}", "error"
+
+    # 4. Dangerous Action Execution (/new, /stop: Admin Gated)
     if ac.startswith("exec_confirm:"):
+        if not _is_admin(open_id, adapter):
+            return None, "⛔ Permission denied: Admin privileges required / 需要管理员权限", "error"
+
         tok = ac.split(":", 1)[1]
         rec = _redeem_token(tok, open_id)
         if not rec:
-            return _resp(toast="⛔ 令牌已失效或操作人变更", toast_type="error")
+            return None, "Token expired or operator mismatch / 令牌失效", "error"
         cmd = rec["cmd"]
         dispatch = getattr(adapter, "_dispatch_synthetic_event", None)
         if callable(dispatch):
             try:
-                from gateway.platforms.event import MessageType  # type: ignore
+                from gateway.platforms.event import MessageType
                 coro = dispatch(
                     text=cmd, message_type=MessageType.COMMAND, chat_id=rec["chat_id"],
                     sender_id=type("S", (), {"open_id": open_id, "user_id": None, "union_id": None})(),
@@ -1597,62 +1386,60 @@ def handle_card_action_sync(adapter: Any, data: Any) -> Optional[Any]:
                     asyncio.run_coroutine_threadsafe(coro, loop)
             except Exception as e:
                 logger.error("[command-palette] dispatch synthetic failed: %s", e)
+
         parent_cat = CMD_PARENT_CATEGORY.get(cmd, "/card/session")
-        card = _card(f"✅ {SESSION_ACTS.get(cmd, {}).get('label', cmd)}", "green", [
-            {"tag": "markdown", "content": f"✅ `{cmd}` 已成功下发到底层执行。"},
+        card = _card(f"✅ {cmd} Executed", "green", [
+            {"tag": "markdown", "content": f"✅ `{cmd}` executed successfully via gateway."},
+            {"tag": "hr"},
             _nav_row_for_deep_page(parent_cat),
         ])
-        return _resp(card, toast=f"{cmd} 已执行")
+        return card, f"{cmd} executed", "info"
 
     if ac == "exec_cancel":
-        return _resp(_root_card(), toast="已取消操作")
+        return _root_card(), "Action cancelled / 操作已取消", "info"
 
-    # ── 5. 复制输出与回显原结果卡 ──
+    # 5. Output View & Copy Actions
     if ac.startswith("copy_output:"):
-        raw_path = ac[len("copy_output:"):]
+        raw_path = ac[len("copy_output:"):].strip()
         safe = _safe_saved_output_path(raw_path)
         if not safe:
-            return _resp(toast="⛔ 无效的归档路径", toast_type="error")
+            return None, "Invalid archive path / 非法路径", "error"
         inferred_cmd = _infer_cmd_from_saved_path(safe)
-        if not inferred_cmd:
-            return _resp(toast="⛔ 无法从归档路径识别命令", toast_type="error")
         card = _build_copy_card(inferred_cmd, safe)
-        return _resp(card, toast="已展开完整内容，请长按或选中复制")
+        return card, "Expanded full text, copy as needed / 请长按或选中复制", "info"
 
     if ac.startswith("show_result:"):
-        raw_path = ac[len("show_result:"):]
+        raw_path = ac[len("show_result:"):].strip()
         safe = _safe_saved_output_path(raw_path)
         if not safe:
-            return _resp(toast="⛔ 无效的归档路径", toast_type="error")
+            return None, "Invalid archive path / 非法路径", "error"
         content, err = _read_saved_output(safe)
         if err:
-            return _resp(toast=f"⛔ 读取失败: {err}", toast_type="error")
+            return None, f"Read error / 读取错误: {err}", "error"
         inferred_cmd = _infer_cmd_from_saved_path(safe)
-        if not inferred_cmd:
-            return _resp(toast="⛔ 无法从归档路径识别命令", toast_type="error")
         result_ok = _result_status_from_text(content)
         card = _build_beautiful_result_card(inferred_cmd, content, ok=result_ok,
-                                             saved_path=safe, status_text="已归档结果")
-        return _resp(card)
+                                             saved_path=safe, status_text="Archived Result (已归档结果)")
+        return card, "Result loaded / 结果已加载", "info"
 
-    # ── 6. 视图导航 ──
+    # 6. Navigation Actions
     if ac.startswith("nav:"):
         card = _nav(ac, sk)
-        return _resp(card)
+        return card, "", "info"
 
-    # ── 6. 命令触发路由 ──
+    # 7. Command Execution Routing
     if ac.startswith("cmd:"):
         cmd = ac[4:].strip()
         meta = _CMD_META.get(cmd)
         if not meta:
-            return _resp(toast=f"⛔ 未知命令 {cmd}", toast_type="error")
+            return None, f"Unknown command {cmd} / 未知命令", "error"
 
-        # 命令冷却检查（3秒内重复触发拦截）
+        # Cooldown Check (3.0s per user per command)
         global _cooldown_check_counter
         cooldown_key = f"{cmd}:{open_id}"
         now_mono = time.monotonic()
         if now_mono - _cmd_cooldown.get(cooldown_key, 0) < 3.0:
-            return _resp(toast="请稍等，命令正在冷却中", toast_type="warning")
+            return None, "Please wait, command in cooldown / 命令冷却中", "warning"
         _cmd_cooldown[cooldown_key] = now_mono
         _cooldown_check_counter += 1
         if _cooldown_check_counter >= 100:
@@ -1663,27 +1450,25 @@ def handle_card_action_sync(adapter: Any, data: Any) -> Optional[Any]:
                 del _cmd_cooldown[k]
 
         if cmd == "/model":
-            return _resp(_build_model_card(sk))
+            return _build_model_card(sk), "", "info"
 
-        # 参数配置类 -> 展示单选选项卡
         if meta.get("options"):
-            return _resp(_build_options_card(cmd))
+            return _build_options_card(cmd), "", "info"
 
-        # 指引模板类 -> 弹出使用格式卡
         if cmd in GUIDE_CMDS:
-            return _resp(_build_guide_card(cmd))
+            return _build_guide_card(cmd), "", "info"
 
-        # 会话危险类 (/new, /stop) -> 弹二次确认卡
         if meta.get("danger"):
+            if not _is_admin(open_id, adapter):
+                return None, "⛔ Permission denied: Admin privileges required / 需要管理员权限", "error"
             tok = _mint_token(cid, open_id, mid, cmd, "")
-            return _resp(_build_exec_confirm_card(cmd, "", tok), toast="请二次确认", toast_type="warning")
+            return _build_exec_confirm_card(cmd, "", tok), "Confirmation required / 请二次确认", "warning"
 
-        # 会话非危险控制命令 (/undo, /retry, /compress) -> 下发真实消息管线执行
         if cmd in SESSION_ACTS:
             dispatch = getattr(adapter, "_dispatch_synthetic_event", None)
             if callable(dispatch):
                 try:
-                    from gateway.platforms.event import MessageType  # type: ignore
+                    from gateway.platforms.event import MessageType
                     coro = dispatch(
                         text=cmd, message_type=MessageType.COMMAND, chat_id=cid,
                         sender_id=type("S", (), {"open_id": open_id, "user_id": None, "union_id": None})(),
@@ -1698,23 +1483,69 @@ def handle_card_action_sync(adapter: Any, data: Any) -> Optional[Any]:
                     logger.error("[command-palette] dispatch synthetic failed: %s", e)
             parent_cat = CMD_PARENT_CATEGORY.get(cmd, "/card/session")
             card = _card(f"✅ {meta.get('label', cmd)}", "green", [
-                {"tag": "markdown", "content": f"✅ `{cmd}`（{meta.get('label', '')}）已直接下发至当前会话处理。"},
+                {"tag": "markdown", "content": f"✅ `{cmd}` sent directly to current session."},
                 {"tag": "hr"},
                 _nav_row_for_deep_page(parent_cat),
             ])
-            return _resp(card, toast=f"{cmd} 已下发")
+            return card, f"{cmd} dispatched", "info"
 
-        # 核心 CLI 查询类命令（/status, /context, /usage, /diff, /doctor, /version, /cron, /plugins...）：
+        # Regular CLI queries (/status, /doctor, /diff, etc.)
         running_card = _build_running_card(cmd)
         if mid:
             _async(_execute_cli_async, cmd, mid)
-        return _resp(running_card, toast=f"正在拉取 {cmd} 数据…")
+        return running_card, f"Running {cmd}... / 正在拉取数据", "info"
 
-    return None
+    return None, "", "info"
+
+
+def _resp(card: dict = None, toast: str = "", toast_type: str = "info"):
+    try:
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            CallBackCard, CallBackToast, P2CardActionTriggerResponse)
+        r = P2CardActionTriggerResponse()
+        if card is not None:
+            c = CallBackCard()
+            c.type = "raw"
+            c.data = card
+            r.card = c
+        if toast:
+            t = CallBackToast()
+            t.type = toast_type
+            t.content = toast
+            r.toast = t
+        return r
+    except Exception:
+        return None
+
+
+def handle_card_action_sync(adapter: Any, data: Any) -> Optional[Any]:
+    event = getattr(data, "event", None)
+    act = getattr(event, "action", None) if not isinstance(event, dict) else (event or {}).get("action")
+    av = (getattr(act, "value", {}) or {}) if act else {}
+    if not isinstance(av, dict):
+        av = {}
+
+    opt = getattr(act, "option", "") or ""
+    if opt and "option" not in av:
+        av["option"] = opt
+
+    ctx = getattr(event, "context", None) if not isinstance(event, dict) else (event or {}).get("context")
+    cid = getattr(ctx, "open_chat_id", "") if ctx else ""
+    mid = getattr(ctx, "open_message_id", "") if ctx else ""
+    operator = getattr(event, "operator", None) if not isinstance(event, dict) else (event or {}).get("operator")
+    open_id = getattr(operator, "open_id", "") if operator else ""
+
+    if mid and cid:
+        _chat_card_map[cid] = mid
+        if len(_chat_card_map) > 500:
+            del _chat_card_map[next(iter(_chat_card_map))]
+
+    card, toast, toast_type = dispatch_palette_action(av, cid, mid, open_id, adapter)
+    return _resp(card, toast, toast_type)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 8. 消息拦截钩子与注册
+# 8. Hook: pre_gateway_dispatch (Official Stock Hermes Path)
 # ════════════════════════════════════════════════════════════════════════════
 
 def _on_msg(event=None, gateway=None, **kw) -> Optional[dict]:
@@ -1732,27 +1563,58 @@ def _on_msg(event=None, gateway=None, **kw) -> Optional[dict]:
     cid = getattr(src, "chat_id", None) or ""
     if not cid:
         return None
+    sender_open_id = getattr(src, "user_id", "") or ""
 
+    # Path A: User sends "/card" command
     if txt == "/card":
+        if not _check_lark_cli():
+            logger.error("[command-palette] lark-cli is not installed in PATH")
+            return None
+        if not _is_operator_allowed(sender_open_id):
+            return {"action": "skip", "reason": "command-palette:unauthorized"}
         _send_root_card(cid, _root_card())
         return {"action": "skip", "reason": "command-palette:card"}
 
+    # Path B: Stock Hermes synthetic message from card clicks: `/card button {...}`
     if txt.startswith("/card "):
-        return {"action": "skip", "reason": "command-palette:in_place_consumed"}
+        rest = txt[6:].strip()
+        av = {}
+        if " " in rest:
+            _, json_part = rest.split(" ", 1)
+            try:
+                av = json.loads(json_part)
+            except Exception:
+                pass
+        else:
+            try:
+                av = json.loads(rest)
+            except Exception:
+                pass
+
+        raw_msg = getattr(event, "raw_message", None)
+        raw_event = getattr(raw_msg, "event", None) if raw_msg else None
+        raw_ctx = getattr(raw_event, "context", None) if raw_event else None
+        mid = getattr(raw_ctx, "open_message_id", "") if raw_ctx else ""
+        if not mid:
+            mid = _chat_card_map.get(cid, "")
+
+        raw_op = getattr(raw_event, "operator", None) if raw_event else None
+        open_id = getattr(raw_op, "open_id", "") if raw_op else sender_open_id
+
+        adapter = None
+        if gateway and hasattr(gateway, "adapters"):
+            from gateway.config import Platform
+            adapter = gateway.adapters.get(Platform.FEISHU)
+
+        card, toast, toast_type = dispatch_palette_action(av, cid, mid, open_id, adapter)
+        if card and mid:
+            _patch_card(mid, card)
+        return {"action": "skip", "reason": "command-palette:action_consumed"}
 
     return None
 
 
 def register(ctx) -> None:
     _cleanup_old_outputs()
-    try:
-        from plugins.platforms.feishu.adapter import FeishuAdapter
-        if not hasattr(FeishuAdapter, "_card_action_handlers"):
-            FeishuAdapter._card_action_handlers = []
-        if handle_card_action_sync not in FeishuAdapter._card_action_handlers:
-            FeishuAdapter._card_action_handlers.append(handle_card_action_sync)
-    except Exception:  # noqa: BLE001
-        pass
-
     ctx.register_hook("pre_gateway_dispatch", _on_msg)
-    logger.info("Hermes command-palette v7.3 (hierarchical nav + 32 rich commands) registered")
+    logger.info("Hermes feishu-command-palette v1.2.0 registered (Stock compatible, English default, sandboxed)")
