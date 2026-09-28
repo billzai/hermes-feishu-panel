@@ -913,10 +913,10 @@ def _switch_hermes_model(tgt_model: str, prov: str) -> tuple[bool, str]:
         pass
 
     prov_str = f"custom:{prov}" if (prov in custom_names or prov == "custom") else prov
-    r1 = run_subprocess(["hermes", "config", "set", "model.provider", prov_str, "--yes"], timeout=10)
+    r1 = run_subprocess(["hermes", "config", "set", "model.provider", prov_str], timeout=10)
     if not r1.ok:
         return False, f"Failed to set model.provider: {r1.stderr or r1.stdout}"
-    r2 = run_subprocess(["hermes", "config", "set", "model.default", tgt_model, "--yes"], timeout=10)
+    r2 = run_subprocess(["hermes", "config", "set", "model.default", tgt_model], timeout=10)
     if not r2.ok:
         return False, f"Failed to set model.default: {r2.stderr or r2.stdout}"
     return True, ""
@@ -1458,6 +1458,9 @@ def _nav(action: str, skey: str = "") -> dict:
     if sub in ("/card/root", "root", "/card"):
         return _root_card(skey)
     if sub in ("/card/model", "model"):
+        with _state_lock:
+            _selected_provider.pop(skey, None)
+            _pending_model.pop(skey, None)
         return _build_model_card(skey)
     cat_list = CATEGORIES_ZH if lang == "zh" else CATEGORIES_EN
     for k, icon, title, color, cmds in cat_list:
@@ -1621,6 +1624,9 @@ def dispatch_palette_action(action_value: dict, cid: str, mid: str, open_id: str
 
         ok, err = _switch_hermes_model(tgt, prov)
         if ok:
+            with _state_lock:
+                _selected_provider.pop(sk, None)
+                _pending_model.pop(sk, None)
             msg = f"{L['switch_success']}\n• {L['active_model']}: `{tgt}`\n• {L['active_prov']}: `{prov}`"
             toast = f"{'已切换至' if lang=='zh' else 'Switched to'} {tgt.split('/')[-1]}"
         else:
@@ -1644,7 +1650,7 @@ def dispatch_palette_action(action_value: dict, cid: str, mid: str, open_id: str
             return None, f"⛔ Invalid option: {val} not in {allowed_opts}", "error"
 
         cfg_key = meta.get("key", f"agent.{cmd.lstrip('/')}")
-        res = run_subprocess(["hermes", "config", "set", cfg_key, val, "--yes"], timeout=10)
+        res = run_subprocess(["hermes", "config", "set", cfg_key, val], timeout=10)
         card = _build_options_card(cmd, skey=sk)
         if res.ok:
             return card, f"{_cmd_label(cmd, lang)} -> {val} ({L['success']})", "info"
@@ -1730,6 +1736,9 @@ def dispatch_palette_action(action_value: dict, cid: str, mid: str, open_id: str
 
         # 7.1 菜单展示类：所有人均可查看
         if cmd == "/model":
+            with _state_lock:
+                _selected_provider.pop(sk, None)
+                _pending_model.pop(sk, None)
             return _build_model_card(sk), "", "info"
 
         if meta.get("options"):
