@@ -8,7 +8,7 @@
 [![GitHub](https://img.shields.io/badge/GitHub-billzai%2Fhermes--feishu--panel-181717?logo=github)](https://github.com/billzai/hermes-feishu-panel)
 [![Gitee](https://img.shields.io/badge/Gitee-biu__zai%2Fhermes--feishu--panel-C71D23?logo=gitee)](https://gitee.com/biu_zai/hermes-feishu-panel)
 [![Version](https://img.shields.io/badge/version-1.3.0-orange)](https://github.com/billzai/hermes-feishu-panel)
-[![Hermes Catalog](https://img.shields.io/badge/Hermes_Catalog-feishu--command--palette-blue?logo=openclaw)](https://github.com/NousResearch/hermes-agent/pull/122519)
+[![PR Pending](https://img.shields.io/badge/PR-Under_Review_%23122519-yellow?logo=github)](https://github.com/NousResearch/hermes-agent/pull/122519)
 
 <!-- Badge Row 2: Tech Stack & Compatibility -->
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB?logo=python)](https://python.org)
@@ -123,19 +123,27 @@ sequenceDiagram
 > ⚠️ **关键外部依赖声明**：本插件使用宿主机操作员安装的 `lark-cli` 进行交互卡片发送与原地更新。
 > 请确保已执行全局安装：`npm install -g @larksuiteoapi/lark-cli` 并完成登录认证。
 
-### 安装方式
+### 安装方式（当前立即可用）
 
-#### 方式一：通过 Hermes 官方插件市场安装（推荐）
+#### 途径一：通过 Hermes CLI 一键安装（推荐，当前立即可用）
+Hermes 原生支持直接通过 Git 仓库安装并启用插件：
+
 ```bash
-# 待官方 PR #122519 合入后，全球用户可直接执行：
-hermes plugins install feishu-command-palette
+# 从 GitHub 仓库一键安装并启用
+hermes plugins install billzai/hermes-feishu-panel --enable
+
+# 或从 Gitee 国内源一键安装并启用（国内网络推荐）
+hermes plugins install https://gitee.com/biu_zai/hermes-feishu-panel.git --enable
+
+# 重载 Hermes Gateway 生效
+systemctl --user restart hermes-gateway
 ```
 
-#### 方式二：通过 Git 克隆安装
+#### 途径二：通过 Git 手动克隆安装（当前立即可用）
 ```bash
-# 1. 克隆代码至本地插件目录 (GitHub 或 Gitee)
+# 1. 克隆代码至本地插件目录 (GitHub 或 Gitee 二选一)
 git clone https://github.com/billzai/hermes-feishu-panel.git ~/.hermes/plugins/feishu-command-palette
-# 国内镜像源克隆：
+# 国内网络镜像克隆：
 # git clone https://gitee.com/biu_zai/hermes-feishu-panel.git ~/.hermes/plugins/feishu-command-palette
 
 # 2. 重载 Hermes Gateway 生效
@@ -284,16 +292,30 @@ feishu-command-palette Plugin
 
 > ⚠️ **Disclosure**: This plugin uses the operator-installed `lark-cli` binary for card sending and in-place patching (`lark-cli im messages patch`).
 
-### Installation
+### Installation (Currently Available Methods)
+
+#### Method 1: Install Directly via Hermes CLI (Recommended)
+Hermes natively supports installing and enabling plugins directly from Git repositories:
 
 ```bash
-# Option 1: Via Hermes Plugin Catalog (Recommended)
-hermes plugins install feishu-command-palette
+# Install directly from GitHub and enable
+hermes plugins install billzai/hermes-feishu-panel --enable
 
-# Option 2: Clone manually
+# Or install from Gitee mirror and enable (Fast in China)
+hermes plugins install https://gitee.com/biu_zai/hermes-feishu-panel.git --enable
+
+# Restart Gateway to apply
+systemctl --user restart hermes-gateway
+```
+
+#### Method 2: Clone Manually
+```bash
+# 1. Clone repository to your local plugins directory (GitHub or Gitee)
 git clone https://github.com/billzai/hermes-feishu-panel.git ~/.hermes/plugins/feishu-command-palette
+# Or using Gitee mirror:
+# git clone https://gitee.com/biu_zai/hermes-feishu-panel.git ~/.hermes/plugins/feishu-command-palette
 
-# Restart Gateway
+# 2. Restart Gateway to apply
 systemctl --user restart hermes-gateway
 ```
 
